@@ -1,24 +1,12 @@
 @echo off
-:: ==============================================================
-:: TikTok 住宅机环境一键卸载脚本 (FRP + GOST 双进程版)
-:: ==============================================================
+setlocal
 chcp 65001 >nul
-title TikTok 住宅机环境一键卸载清理 (FRP + GOST)
-
-:: 检查是否具备管理员权限
->nul 2>&1 "%SYSTEMROOT%\system32\cacls.exe" "%SYSTEMROOT%\system32\config\system"
-if '%errorlevel%' NEQ '0' (
-    echo [提示] 正在请求系统管理员权限，请在弹出的系统提示中点击【是】...
-    powershell -NoProfile -Command "Start-Process cmd -ArgumentList '/c \"\"%~f0\"\"' -Verb RunAs"
-    exit /b
-)
-
-:: 切换到当前脚本所在目录
-cd /d "%~dp0"
-
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0uninstall_frp_gost.ps1"
-
+title TikTok 住宅机卸载 (FRP + GOST)
+rem PowerShell 自行请求管理员权限，并等待提升后的脚本结束。
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0uninstall_frp_gost.ps1"
+set "ExitCode=%ERRORLEVEL%"
 echo.
-echo =======================================================
+echo 脚本退出码：%ExitCode% （0=完成，非0=失败，请查看上方信息）
 echo 请按任意键关闭此窗口...
 pause >nul
+exit /b %ExitCode%

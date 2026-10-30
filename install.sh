@@ -1,133 +1,108 @@
 #!/bin/bash
-# ==============================================================================
-# 🚀 TikTok 日本/跨境电商双入站物理隔离网络 - VPS 一体化主入口引导脚本
-# 仓库：https://github.com/Geoege-xll/server-gost-frp
-# 功能：交互式 2 选 1 安装菜单、平滑升级、快捷运维
-# ==============================================================================
+# VPS 双方案入口；远程单文件启动时下载同一提交的完整仓库。
+set -euo pipefail
 
-set -e
+usage() {
+    printf '%s\n' \
+        '用法：bash install.sh [gost|frp] [--upgrade] [--version vX.Y.Z]' \
+        '      bash install.sh --upgrade [--version vX.Y.Z]' \
+        '无参数：显示首次安装二选一菜单。升级会重启服务并中断现有连接。'
+}
 
-# 必须以 root 权限运行
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "\033[31m❌ 错误：请使用 root 权限运行此脚本！(例如 sudo bash $0)\033[0m"
-    exit 1
+fetch() {
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+        --tlsv1.2 --connect-timeout 10 --max-time 600 --retry 3 --output "$2" "$1"
+}
+
+bootstrap_repository() {
+    [ "$(uname -s)" = Linux ] || { printf '远程安装入口仅支持 Linux。\n' >&2; exit 1; }
+    [ "$(id -u)" = 0 ] || { printf '请以 root / sudo 运行。\n' >&2; exit 1; }
+    command -v apt-get >/dev/null || { printf '自动部署支持 Debian / Ubuntu。\n' >&2; exit 1; }
+    # 在任何仓库脚本执行前补齐引导依赖；不自动切换第三方镜像。
+    if ! command -v python3 >/dev/null || ! command -v curl >/dev/null; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y python3 curl ca-certificates
+    fi
+    BOOTSTRAP_DIR=$(mktemp -d)
+    trap 'rm -rf -- "$BOOTSTRAP_DIR"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    mkdir -m 700 "$BOOTSTRAP_DIR/downloads" "$BOOTSTRAP_DIR/source"
+    local commit=${REPO_COMMIT:-}
+    if [ -z "$commit" ]; then
+        fetch 'https://api.github.com/repos/Geoege-xll/server-gost-frp/commits/main' "$BOOTSTRAP_DIR/downloads/commit.json"
+        commit=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha"])' "$BOOTSTRAP_DIR/downloads/commit.json")
+    fi
+    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { printf '仓库提交号无效。\n' >&2; exit 1; }
+    printf '下载完整仓库，提交：%s\n' "$commit"
+    fetch "https://codeload.github.com/Geoege-xll/server-gost-frp/tar.gz/$commit" "$BOOTSTRAP_DIR/downloads/repository.tar.gz"
+    # 归档作为数据处理：拒绝路径穿越、链接和特殊文件。
+    python3 -I - "$BOOTSTRAP_DIR/downloads/repository.tar.gz" "$BOOTSTRAP_DIR/source" <<'PY'
+import pathlib, shutil, sys, tarfile
+root = pathlib.Path(sys.argv[2])
+with tarfile.open(sys.argv[1], 'r:gz') as archive:
+    for member in archive:
+        path = pathlib.PurePosixPath(member.name)
+        if path.is_absolute() or '..' in path.parts or '\\' in member.name:
+            raise SystemExit('Unsafe repository archive path')
+        target = root.joinpath(*path.parts)
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif member.isfile():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.extractfile(member) as src, target.open('wb') as dst:
+                shutil.copyfileobj(src, dst)
+        else:
+            raise SystemExit('Repository archive links / special files are not allowed')
+PY
+    local checkout="$BOOTSTRAP_DIR/source/server-gost-frp-$commit"
+    [ -s "$checkout/install.sh" ] && [ -s "$checkout/lib/deploy.sh" ] && [ -s "$checkout/lib/release.py" ] || {
+        printf '仓库不完整，未执行安装。\n' >&2; exit 1;
+    }
+    bash "$checkout/install.sh" "$@"
+}
+
+if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then usage; exit 0; fi
+
+SCRIPT_FILE=${BASH_SOURCE[0]:-}
+REPO_ROOT=
+if [ -n "$SCRIPT_FILE" ] && [ -f "$SCRIPT_FILE" ]; then
+    REPO_ROOT=$(cd -- "$(dirname -- "$SCRIPT_FILE")" && pwd)
 fi
-
-REPO_RAW="https://raw.githubusercontent.com/Geoege-xll/server-gost-frp/main"
-
-# 检查网络镜像加速 (国内网络自动/手动切换)
-check_mirror() {
-    if ! curl -s --connect-timeout 3 -I "https://raw.githubusercontent.com" >/dev/null 2>&1; then
-        echo -e "\033[33m⚠️ 检测到直连 GitHub 访问受限，已自动启用加速镜像源...\033[0m"
-        REPO_RAW="https://ghproxy.net/https://raw.githubusercontent.com/Geoege-xll/server-gost-frp/main"
-    fi
-}
-
-install_pure_gost() {
-    echo -e "\n\033[36m🚀 正在启动【方案一：纯 GOST v3 极速架构】安装程序...\033[0m\n"
-    if [ -f "./01_Pure_GOST_v3/install_vps_gost_v3.sh" ]; then
-        bash ./01_Pure_GOST_v3/install_vps_gost_v3.sh
-    else
-        check_mirror
-        bash <(curl -fsSL "${REPO_RAW}/01_Pure_GOST_v3/install_vps_gost_v3.sh")
-    fi
-}
-
-install_frp_gost() {
-    echo -e "\n\033[36m🚀 正在启动【方案二：FRP + GOST 经典双进程架构】安装程序...\033[0m\n"
-    if [ -f "./02_FRP_GOST/install_vps_frp_gost.sh" ]; then
-        bash ./02_FRP_GOST/install_vps_frp_gost.sh
-    else
-        check_mirror
-        bash <(curl -fsSL "${REPO_RAW}/02_FRP_GOST/install_vps_frp_gost.sh")
-    fi
-}
-
-upgrade_service() {
-    echo -e "\n\033[36m🔍 正在检查当前 VPS 已运行的隧道服务...\033[0m"
-    if systemctl is-active --quiet gost 2>/dev/null; then
-        echo -e "   -> 检测到已运行 \033[32mGOST v3\033[0m 服务，正在执行平滑升级..."
-        if [ -f "./01_Pure_GOST_v3/install_vps_gost_v3.sh" ]; then
-            bash ./01_Pure_GOST_v3/install_vps_gost_v3.sh --upgrade
-        else
-            check_mirror
-            bash <(curl -fsSL "${REPO_RAW}/01_Pure_GOST_v3/install_vps_gost_v3.sh") --upgrade
-        fi
-    elif systemctl is-active --quiet frps 2>/dev/null; then
-        echo -e "   -> 检测到已运行 \033[32mFRP\033[0m 服务，正在执行平滑升级..."
-        if [ -f "./02_FRP_GOST/install_vps_frp_gost.sh" ]; then
-            bash ./02_FRP_GOST/install_vps_frp_gost.sh --upgrade
-        else
-            check_mirror
-            bash <(curl -fsSL "${REPO_RAW}/02_FRP_GOST/install_vps_frp_gost.sh") --upgrade
-        fi
-    else
-        echo -e "\033[33m[!] 未检测到后台有运行中的 gost 或 frps 守护服务。\033[0m"
-        echo "请选择您要升级的具体方案："
-        echo "1) 升级 GOST v3"
-        echo "2) 升级 FRP"
-        read -p "请输入 [1-2]: " UP_CHOICE </dev/tty
-        if [ "$UP_CHOICE" == "1" ]; then
-            check_mirror
-            bash <(curl -fsSL "${REPO_RAW}/01_Pure_GOST_v3/install_vps_gost_v3.sh") --upgrade
-        elif [ "$UP_CHOICE" == "2" ]; then
-            check_mirror
-            bash <(curl -fsSL "${REPO_RAW}/02_FRP_GOST/install_vps_frp_gost.sh") --upgrade
-        fi
-    fi
-}
-
-# 命令行静默参数直接处理
-if [ "$1" == "1" ] || [ "$1" == "gost" ]; then
-    install_pure_gost
-    exit 0
-elif [ "$1" == "2" ] || [ "$1" == "frp" ]; then
-    install_frp_gost
-    exit 0
-elif [ "$1" == "3" ] || [ "$1" == "--upgrade" ] || [ "$1" == "-u" ] || [ "$1" == "upgrade" ]; then
-    upgrade_service
+if [ -z "$REPO_ROOT" ] || [ ! -f "$REPO_ROOT/lib/deploy.sh" ] || [ ! -f "$REPO_ROOT/lib/release.py" ]; then
+    bootstrap_repository "$@"
     exit 0
 fi
+# shellcheck source=lib/deploy.sh
+source "$REPO_ROOT/lib/deploy.sh"
 
-# 交互式主菜单
-clear
-echo "======================================================================"
-echo -e "\033[36m🚀 TikTok 日本/跨境电商双入站物理隔离网络 - VPS 一体化安装引擎\033[0m"
-echo -e "   项目源码: \033[34mhttps://github.com/Geoege-xll/server-gost-frp\033[0m"
-echo "======================================================================"
-echo ""
-echo -e "请选择您想要部署或操作的方案：\n"
-echo -e "  \033[32m[1]\033[0m \033[1m方案一：纯 GOST v3 极速架构\033[0m \033[33m【🌟 强烈推荐】\033[0m"
-echo -e "      • 架构：单进程、全链路 mTLS 强证书认证、TCP NoDelay 零延迟"
-echo -e "      • 优势：超轻量 (~15MB 内存)、无 FRP 协议指纹、视频流极度丝滑、排障最简单"
-echo ""
-echo -e "  \033[32m[2]\033[0m \033[1m方案二：FRP + GOST 经典双进程架构\033[0m"
-echo -e "      • 架构：FRP v0.71.1 (WireProtocol v2 硬件 AEAD) + GOST v3.3.2 出口网关"
-echo -e "      • 优势：经典架构成熟稳健、带 WebStatus 仪表盘、适合习惯 FRP 的团队"
-echo ""
-echo -e "  \033[32m[3]\033[0m \033[1m在线平滑升级内核 (保留现有配置与证书)\033[0m"
-echo -e "  \033[31m[4]\033[0m 退出安装"
-echo ""
-echo "----------------------------------------------------------------------"
-read -p "请输入序号 [1-4] (默认回车选择 1 纯GOSTv3): " USER_CHOICE </dev/tty
-USER_CHOICE=${USER_CHOICE:-1}
+upgrade_detected() {
+    local gost_installed=0 frp_installed=0
+    [ ! -f /etc/gost/gost.yaml ] || gost_installed=1
+    if [ -f /etc/frp/frps.toml ] || [ -f /root/frp/frps.toml ]; then frp_installed=1; fi
+    if [ "$gost_installed" = 1 ] && [ "$frp_installed" = 0 ]; then
+        deploy_main gost --upgrade "$@"
+    elif [ "$frp_installed" = 1 ] && [ "$gost_installed" = 0 ]; then
+        deploy_main frp --upgrade "$@"
+    else
+        fail '无法唯一确定已有方案；请显式指定 gost --upgrade 或 frp --upgrade'
+    fi
+}
 
-case "$USER_CHOICE" in
-    1)
-        install_pure_gost
-        ;;
-    2)
-        install_frp_gost
-        ;;
-    3)
-        upgrade_service
-        ;;
-    4)
-        echo "已退出安装。"
-        exit 0
-        ;;
-    *)
-        echo -e "\033[31m输入错误，请输入 1 ~ 4 之间的数字！\033[0m"
-        exit 1
-        ;;
+case "${1:-}" in
+    1|gost) shift; deploy_main gost "$@" ;;
+    2|frp) shift; deploy_main frp "$@" ;;
+    3|--upgrade|-u|upgrade) shift; upgrade_detected "$@" ;;
+    '')
+        printf '\n住宅出口反向隧道部署\n\n1) 纯 GOST v3（住宅机单进程）\n2) FRP + GOST（住宅机双进程）\n3) 升级已有服务端内核（保留配置，重启会断连）\n4) 退出\n\n'
+        printf '请选择 [1-4]：' >/dev/tty
+        read -r choice </dev/tty || fail '无法读取选择；请在命令行指定 gost 或 frp'
+        case "$choice" in
+            1) deploy_main gost ;;
+            2) deploy_main frp ;;
+            3) upgrade_detected ;;
+            4) exit 0 ;;
+            *) fail '请输入 1、2、3 或 4；不会默认安装' ;;
+        esac ;;
+    *) usage >&2; exit 1 ;;
 esac

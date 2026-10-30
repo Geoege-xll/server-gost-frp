@@ -1,166 +1,178 @@
+﻿# ==============================================================
+# TikTok 住宅机端 - FRP + GOST 离线部署 (Windows PowerShell 5.1)
 # ==============================================================
-# TikTok 住宅机端 - 极速部署系统 (V2.5 纯离线/自愈傻瓜版)
-# ==============================================================
-
-# 1. 确保以管理员权限执行
-if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host "正在请求管理员权限，请在弹窗中选择【是】..." -ForegroundColor Yellow
-    Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
-    Exit
-}
-
-# 2. 定位当前目录与安装目标路径
-$CurrentDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-if ([string]::IsNullOrWhiteSpace($CurrentDir)) { $CurrentDir = $PSScriptRoot }
-if ([string]::IsNullOrWhiteSpace($CurrentDir)) { $CurrentDir = (Get-Location).Path }
-
-$ToolsDir = "C:\Tools"
+$ErrorActionPreference = 'Stop'
+$CurrentDir = $PSScriptRoot
+$ToolsDir = 'C:\Tools\TikTokFrpGost'
 $CertsDir = "$ToolsDir\certs"
-$LogsDir  = "$ToolsDir\logs"
-$P_HS     = "https"
+$LogsDir = "$ToolsDir\logs"
+$ServyDir = "$ToolsDir\servy"
+$ServiceNames = @('TikTok_FRPGost', 'TikTok_FRP')
 
-# 占位符变量（在 VPS 生成包时会被 sed 自动注入真实数据）
+# 占位符变量（由 VPS 生成离线包时注入）
 $VpsServerIp = "VPS_PUBLIC_IP_PLACEHOLDER"
-$AuthToken   = "TOKEN_PLACEHOLDER"
-$GostUser    = "GOST_USER_PLACEHOLDER"
-$GostPass    = "GOST_PASS_PLACEHOLDER"
+$AuthToken = "TOKEN_PLACEHOLDER"
+$GostUser = "GOST_USER_PLACEHOLDER"
+$GostPass = "GOST_PASS_PLACEHOLDER"
 
-Clear-Host
-Write-Host "=================================================" -ForegroundColor Cyan
-Write-Host "🚀 Windows 住宅机端 - 极速部署系统 (V2.5 傻瓜版)" -ForegroundColor Cyan
-Write-Host "=================================================" -ForegroundColor Cyan
-Write-Host ""
-
-# -------------------------------------------------------------
-# A. 初始化目录与 Windows Defender 防病毒白名单
-# -------------------------------------------------------------
-Write-Host "📁 [1/6] 正在初始化运行环境并添加防病毒白名单..." -ForegroundColor Yellow
-New-Item -Path $ToolsDir, $CertsDir, $LogsDir -ItemType Directory -Force | Out-Null
-
-try {
-    # 率先添加白名单，防止后续拷贝 exe 时被杀软瞬间拦截
-    Add-MpPreference -ExclusionPath $ToolsDir -ErrorAction SilentlyContinue
-    Write-Host "   -> 安全防护白名单已应用: $ToolsDir" -ForegroundColor Green
-} catch {
-    Write-Host "   [!] 未能自动配置 Defender 白名单，如遇杀软拦截请手动放行。" -ForegroundColor DarkGray
+function Find-ServyCli([string]$Directory) {
+    $Files = @(Get-ChildItem -LiteralPath $Directory -Recurse -File -Filter 'servy-cli.exe')
+    if ($Files.Count -ne 1) { throw "需要完整 servy 目录，且其中必须恰好有一个 servy-cli.exe：$Directory" }
+    if ($Files[0].Length -eq 0) { throw "servy-cli.exe 文件为空：$Directory" }
+    return $Files[0].FullName
 }
 
-# -------------------------------------------------------------
-# B. 配置系统电源策略 (防止住宅电脑休眠导致断网)
-# -------------------------------------------------------------
-Write-Host "⚡ [2/6] 正在优化系统电源策略 (防止待机/休眠掉线)..." -ForegroundColor Yellow
-try {
-    & powercfg /change standby-timeout-ac 0 2>$null
-    & powercfg /change hibernate-timeout-ac 0 2>$null
-    & powercfg /change monitor-timeout-ac 15 2>$null
-    Write-Host "   -> 电源计划已优化：接通电源下永不休眠。" -ForegroundColor Green
-} catch {
-    Write-Host "   [!] 无法修改电源计划，建议手动在控制面板中关闭睡眠。" -ForegroundColor DarkGray
-}
-
-# -------------------------------------------------------------
-# C. 验证并安装 mTLS 安全证书
-# -------------------------------------------------------------
-Write-Host "🔐 [3/6] 正在校验并安装 mTLS 双向加密证书..." -ForegroundColor Yellow
-$CaCert     = Join-Path $CurrentDir "ca.crt"
-$ClientCert = Join-Path $CurrentDir "client.crt"
-$ClientKey  = Join-Path $CurrentDir "client.key"
-
-if ((Test-Path $CaCert) -and (Test-Path $ClientCert) -and (Test-Path $ClientKey)) {
-    Copy-Item -Path $CaCert, $ClientCert, $ClientKey -Destination $CertsDir -Force
-    Write-Host "   -> 证书校验成功并已导入安全存储区。" -ForegroundColor Green
-} else {
-    Write-Host "❌ 致命错误：未找到验证证书！请确保您完整解压了 ZIP 压缩包。" -ForegroundColor Red
-    Write-Host "   缺少: ca.crt / client.crt / client.key" -ForegroundColor Red
-    Read-Host "按回车键退出..."
-    Exit
-}
-
-# -------------------------------------------------------------
-# D. 部署执行程序 (优先离线，兜底在线)
-# -------------------------------------------------------------
-Write-Host "📦 [4/6] 正在部署核心组件程序 (离线极速模式)..." -ForegroundColor Yellow
-
-# 拷贝本地已打包好的可执行文件
-Get-ChildItem -Path $CurrentDir -Filter "*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-    Copy-Item -Path $_.FullName -Destination $ToolsDir -Force
-}
-
-# 拷贝可能解压带入的 DLL 或配置文件
-Get-ChildItem -Path $CurrentDir -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
-    Copy-Item -Path $_.FullName -Destination $ToolsDir -Force
-}
-
-# 兜底检测：如果本地包里缺少某些核心组件，则尝试在线补齐
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-# 1. 检查 frpc.exe
-if (!(Test-Path "$ToolsDir\frpc.exe")) {
-    Write-Host "   [!] 本地未包含 frpc.exe，正在尝试从 GitHub 备用源下载..." -ForegroundColor DarkYellow
+function Assert-OwnedService([string]$Name, [string]$Cli) {
+    if ($null -eq (Get-Service -Name $Name -ErrorAction SilentlyContinue)) { return }
+    # Servy 10.7 的 SCM 路径是共享 wrapper，须检查官方导出的真实程序配置。
+    $ExportPath = Join-Path ([IO.Path]::GetTempPath()) ("TikTok-service-" + [Guid]::NewGuid().ToString('N') + '.json')
     try {
-        $FrpVer = "0.71.1"
-        $FrpUrl = "$P_HS://github.com/fatedier/frp/releases/download/v$FrpVer/frp_$($FrpVer)_windows_amd64.zip"
-        Invoke-WebRequest -Uri $FrpUrl -OutFile "$ToolsDir\frp.zip" -TimeoutSec 15
-        Expand-Archive -Path "$ToolsDir\frp.zip" -DestinationPath "$ToolsDir\frp_temp" -Force
-        Get-ChildItem -Path "$ToolsDir\frp_temp" -Recurse -Filter "frpc.exe" | Move-Item -Destination "$ToolsDir\frpc.exe" -Force
-        Remove-Item -Path "$ToolsDir\frp.zip", "$ToolsDir\frp_temp" -Recurse -Force
-    } catch {
-        Write-Host "❌ frpc.exe 下载失败，请检查网络。" -ForegroundColor Red
+        & $Cli export --quiet --name=$Name --config=json --path=$ExportPath | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "无法确认 $Name 的 Servy 配置归属，退出码 $LASTEXITCODE。请先使用对应旧版卸载方式处理。" }
+        $Config = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($ExportPath))
+        $Program = if ($Name -eq 'TikTok_FRP') { 'frpc.exe' } else { 'gost.exe' }
+        if ($Config.Name -ine $Name -or [IO.Path]::GetFullPath($Config.ExecutablePath) -ine "$ToolsDir\$Program" -or [IO.Path]::GetFullPath($Config.StartupDirectory).TrimEnd('\') -ine $ToolsDir) {
+            throw "服务 $Name 不属于 $ToolsDir（可能是旧版共享安装）。请先用对应旧版卸载方式处理；本脚本不会改动它。"
+        }
+    } finally {
+        if (Test-Path -LiteralPath $ExportPath) { Remove-Item -LiteralPath $ExportPath -Force }
     }
 }
 
-# 2. 检查 gost.exe
-if (!(Test-Path "$ToolsDir\gost.exe")) {
-    Write-Host "   [!] 本地未包含 gost.exe，正在尝试从 GitHub 备用源下载..." -ForegroundColor DarkYellow
-    try {
-        $GostVer = "3.3.2"
-        $GostUrl = "$P_HS://github.com/go-gost/gost/releases/download/v$GostVer/gost_$($GostVer)_windows_amd64.zip"
-        Invoke-WebRequest -Uri $GostUrl -OutFile "$ToolsDir\gost.zip" -TimeoutSec 15
-        Expand-Archive -Path "$ToolsDir\gost.zip" -DestinationPath "$ToolsDir\gost_temp" -Force
-        Get-ChildItem -Path "$ToolsDir\gost_temp" -Recurse -Filter "gost*.exe" | Move-Item -Destination "$ToolsDir\gost.exe" -Force
-        Remove-Item -Path "$ToolsDir\gost.zip", "$ToolsDir\gost_temp" -Recurse -Force
-    } catch {
-        Write-Host "❌ gost.exe 下载失败，请检查网络。" -ForegroundColor Red
+function Assert-LocalGateway([bool]$Required) {
+    $Connections = @(Get-NetTCPConnection -State Listen -LocalPort 10000 -ErrorAction SilentlyContinue)
+    if ($Required -and $Connections.Count -eq 0) { throw '本方案本地 SOCKS5 端口 10000 尚未监听，请检查日志后重试。' }
+    foreach ($Connection in $Connections) {
+        $ProcessInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$($Connection.OwningProcess)"
+        if ($null -eq $ProcessInfo -or $ProcessInfo.ExecutablePath -ine "$ToolsDir\gost.exe") {
+            throw '本地端口 10000 被其他程序或方案占用。请先停止/卸载对应程序；本脚本不会终止它。'
+        }
     }
 }
 
-# 3. 检查 servy-cli.exe
-$ServyCliPath = "$ToolsDir\servy-cli.exe"
-if (!(Test-Path $ServyCliPath) -and (Get-Command "servy-cli.exe" -ErrorAction SilentlyContinue)) {
-    $ServyCliPath = (Get-Command "servy-cli.exe").Source
+function Install-TunnelService([string]$Name, [string]$DisplayName, [string]$Program, [string]$Parameters, [string]$LogName) {
+    # Servy 官方：恢复参数只在 enableHealth 时生效；0 表示无限重试。
+    & $ServyCliPath install --quiet --name=$Name --displayName=$DisplayName `
+        --description='TikTok FRP and GOST residential client' `
+        --path="$ToolsDir\$Program" --startupDir=$ToolsDir --params=$Parameters `
+        --startupType=Automatic --enableHealth --heartbeatInterval=10 --maxFailedChecks=3 `
+        --recoveryAction=RestartService --maxRestartAttempts=0 `
+        --stdout="$LogsDir\$LogName.log" --stderr="$LogsDir\${LogName}_err.log" `
+        --enableSizeRotation --rotationSize=10 --maxRotations=5
+    if ($LASTEXITCODE -ne 0) { throw "Servy 安装 $Name 失败，退出码 $LASTEXITCODE。" }
+    & $ServyCliPath start --quiet --name=$Name
+    if ($LASTEXITCODE -ne 0) { throw "Servy 启动 $Name 失败，退出码 $LASTEXITCODE。" }
+    $Service = Get-Service -Name $Name
+    $Service.WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
 }
 
-Write-Host "   -> 核心运行组件就绪！" -ForegroundColor Green
+try {
+    # 只读预检：任何占位符或离线文件缺失都在系统变更之前拒绝。
+    foreach ($Value in @($VpsServerIp, $AuthToken, $GostUser, $GostPass)) {
+        if ([string]::IsNullOrWhiteSpace($Value) -or $Value -match 'PLACEHOLDER') { throw '配置尚未注入，请使用 VPS 生成的完整离线包。' }
+    }
+    $ParsedIp = $null
+    if (![Net.IPAddress]::TryParse($VpsServerIp, [ref]$ParsedIp) -or $ParsedIp.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) {
+        throw 'VPS 地址必须是服务器证书 IP SAN 中的公网 IPv4 地址。'
+    }
+    foreach ($Name in @('gost.exe', 'frpc.exe', 'ca.crt', 'client.crt', 'client.key')) {
+        $File = Get-Item -LiteralPath (Join-Path $CurrentDir $Name)
+        if ($File.PSIsContainer -or $File.Length -eq 0) { throw "离线包文件无效：$Name" }
+    }
+    $SourceServyDir = Join-Path $CurrentDir 'servy'
+    $SourceCli = Find-ServyCli $SourceServyDir
+    if ([IO.Path]::GetFullPath($CurrentDir).TrimEnd('\').StartsWith($ToolsDir, [StringComparison]::OrdinalIgnoreCase)) {
+        throw '请将离线包解压到运行目录之外，再执行安装。'
+    }
+    if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $Child = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs -Wait -PassThru
+        exit $Child.ExitCode
+    }
+    foreach ($Directory in @('C:\Tools', $ToolsDir, $CertsDir, $LogsDir, $ServyDir)) {
+        if ((Test-Path -LiteralPath $Directory) -and ((Get-Item -LiteralPath $Directory).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "拒绝使用链接目录：$Directory" }
+    }
+    if ($null -ne (Get-Service -Name 'TikTok_Gost' -ErrorAction SilentlyContinue)) {
+        throw '检测到旧版共享服务 TikTok_Gost。请先使用对应旧版卸载方式处理；不会修改或删除旧 C:\Tools 共享安装。'
+    }
+    $OtherServyServices = @(Get-CimInstance Win32_Service | Where-Object { $_.Name -notin $ServiceNames -and $_.PathName -match 'Servy\.Service(?:\.CLI)?\.exe' })
+    if ($OtherServyServices.Count -gt 0) { throw "检测到其他 Servy 托管服务：$($OtherServyServices.Name -join ', ')。Servy 10.7 共享运行时可能影响它们，请先处理对应安装。" }
+    foreach ($Name in $ServiceNames) { Assert-OwnedService $Name $SourceCli }
+    Assert-LocalGateway $false
 
-# -------------------------------------------------------------
-# E. 写入 FRP 客户端配置文件
-# -------------------------------------------------------------
-Write-Host "⚙️  [5/6] 正在生成加密隧道配置文件 (frpc.toml)..." -ForegroundColor Yellow
+    Write-Host '[1/5] 停止并注销本方案已有服务（先全部停止，再复制程序）...' -ForegroundColor Cyan
+    foreach ($Name in @('TikTok_FRP', 'TikTok_FRPGost')) {
+        $Existing = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        if ($null -ne $Existing) {
+            if ($Existing.Status -ne 'Stopped') { Stop-Service -Name $Name; $Existing.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30)) }
+            & $SourceCli uninstall --quiet --name=$Name
+            if ($LASTEXITCODE -ne 0) { throw "Servy 卸载 $Name 失败，退出码 $LASTEXITCODE。" }
+            for ($Attempt = 0; $Attempt -lt 30; $Attempt++) {
+                if ($null -eq (Get-Service -Name $Name -ErrorAction SilentlyContinue)) { break }
+                Start-Sleep -Seconds 1
+            }
+            if ($null -ne (Get-Service -Name $Name -ErrorAction SilentlyContinue)) { throw "$Name 尚未删除，请关闭服务管理窗口后重试。" }
+        }
+    }
 
-$FrpcConfig = @"
+    for ($Attempt = 0; $Attempt -lt 30; $Attempt++) {
+        $Remaining = @(Get-CimInstance Win32_Process -Filter "Name='gost.exe' OR Name='frpc.exe'" | Where-Object { $_.ExecutablePath -in @("$ToolsDir\gost.exe", "$ToolsDir\frpc.exe") })
+        if ($Remaining.Count -eq 0) { break }
+        if ($Attempt -eq 29) { throw '本方案 gost.exe/frpc.exe 尚未退出；请关闭本方案手动运行的进程后重试，不会强制杀进程。' }
+        Start-Sleep -Seconds 1
+    }
+    Write-Host '[2/5] 复制离线程序、证书和完整 Servy 目录...' -ForegroundColor Cyan
+    # 只替换本方案 Servy 树，避免发行包顶层目录名变化留下多个 CLI。
+    if (Test-Path -LiteralPath $ServyDir) { Remove-Item -LiteralPath $ServyDir -Recurse -Force }
+    New-Item -Path $ToolsDir, $CertsDir, $LogsDir, $ServyDir -ItemType Directory -Force | Out-Null
+    foreach ($Name in @('gost.exe', 'frpc.exe')) { Copy-Item -LiteralPath (Join-Path $CurrentDir $Name) -Destination $ToolsDir -Force }
+    foreach ($Name in @('ca.crt', 'client.crt', 'client.key')) { Copy-Item -LiteralPath (Join-Path $CurrentDir $Name) -Destination $CertsDir -Force }
+    Get-ChildItem -LiteralPath $SourceServyDir -Force | Copy-Item -Destination $ServyDir -Recurse -Force
+    $ServyCliPath = Find-ServyCli $ServyDir
+
+    Write-Host '[3/5] 写入 GOST 和 FRP 配置...' -ForegroundColor Cyan
+    $GostUserYaml = ConvertTo-Json -InputObject $GostUser -Compress
+    $GostPassYaml = ConvertTo-Json -InputObject $GostPass -Compress
+    $GostYaml = @"
+services:
+  - name: local-socks5
+    addr: "127.0.0.1:10000"
+    handler:
+      type: socks5
+      auth:
+        username: $GostUserYaml
+        password: $GostPassYaml
+    listener:
+      type: tcp
+"@
+    # TOML basic string 与 JSON 的字符串转义兼容。
+    $AuthTokenToml = ConvertTo-Json -InputObject $AuthToken -Compress
+    $FrpcConfig = @"
 serverAddr = "$VpsServerIp"
 serverPort = 9000
 transport.protocol = "tcp"
 transport.wireProtocol = "v2"
 transport.tls.enable = true
-transport.tls.certFile = "C:/Tools/certs/client.crt"
-transport.tls.keyFile = "C:/Tools/certs/client.key"
-transport.tls.trustedCaFile = "C:/Tools/certs/ca.crt"
+transport.tls.serverName = "$VpsServerIp"
+transport.tls.certFile = "C:/Tools/TikTokFrpGost/certs/client.crt"
+transport.tls.keyFile = "C:/Tools/TikTokFrpGost/certs/client.key"
+transport.tls.trustedCaFile = "C:/Tools/TikTokFrpGost/certs/ca.crt"
 transport.heartbeatInterval = 15
 transport.heartbeatTimeout = 90
 transport.tcpMux = true
 auth.method = "token"
-auth.token = "$AuthToken"
+auth.token = $AuthTokenToml
 loginFailExit = false
 
+# TCP 映射的绑定地址由 frps 的 proxyBindAddr 控制，服务端必须为 127.0.0.1。
 [[proxies]]
 name = "jp_socks5"
 type = "tcp"
 localIP = "127.0.0.1"
 localPort = 10000
 remotePort = 10001
-transport.useEncryption = true
-transport.useCompression = true
+# 全局 TLS 已加密，不重复做 payload 加密；视频流不再压缩。
+transport.useEncryption = false
+transport.useCompression = false
 
 [[proxies]]
 name = "jp_rdp"
@@ -168,140 +180,64 @@ type = "tcp"
 localIP = "127.0.0.1"
 localPort = 3389
 remotePort = 33389
-transport.useEncryption = true
-transport.useCompression = true
+transport.useEncryption = false
+transport.useCompression = false
 "@
+    [IO.File]::WriteAllText("$ToolsDir\gost.yaml", $GostYaml, (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText("$ToolsDir\frpc.toml", $FrpcConfig, (New-Object Text.UTF8Encoding($false)))
+    $SocksInfoPath = Join-Path $ToolsDir 'SOCKS5账号密码.txt'
+    $SocksInfo = @"
+SOCKS5 连接信息（FRP + GOST）
+配套 VPS：$VpsServerIp
+住宅机本地地址：127.0.0.1:10000
+VPS 上的 S-UI 出站地址：127.0.0.1:10001（VPS 回环地址，不对公网开放）
+账号：$GostUser
+密码：$GostPass
 
-Set-Content -Path "$ToolsDir\frpc.toml" -Value $FrpcConfig -Encoding Ascii
-Write-Host "   -> 隧道配置已写入: $ToolsDir\frpc.toml" -ForegroundColor Green
+账号密码与本次写入的 gost.yaml 一致；住宅机不会重新生成账号密码。
+本文件含明文密码，请妥善保管，勿上传公开仓库或转发。
+保存此文件不代表隧道已连通；请另行完成链路验收。
+"@
+    [IO.File]::WriteAllText($SocksInfoPath, ($SocksInfo -replace '\r?\n', "`r`n"), (New-Object Text.UTF8Encoding($true)))
+    Write-Host "SOCKS5 账号密码已保存：$SocksInfoPath（明文文件，请妥善保管）"
+    & "$ToolsDir\frpc.exe" verify -c "$ToolsDir\frpc.toml"
+    if ($LASTEXITCODE -ne 0) { throw "frpc 配置检查失败，退出码 $LASTEXITCODE。" }
 
-# -------------------------------------------------------------
-# F. 注册为 Windows 后台系统服务 (无感运行、崩溃自启)
-# -------------------------------------------------------------
-Write-Host "🚀 [6/6] 正在注册并启动后台系统服务..." -ForegroundColor Yellow
-
-if (Test-Path $ServyCliPath) {
-    try {
-        # 卸载可能存在的历史残留服务
-        & $ServyCliPath stop --quiet --name="TikTok_Gost" 2>$null
-        & $ServyCliPath stop --quiet --name="TikTok_FRP" 2>$null
-        & $ServyCliPath uninstall --quiet --name="TikTok_Gost" 2>$null
-        & $ServyCliPath uninstall --quiet --name="TikTok_FRP" 2>$null
-
-        # 安装 GOST 代理服务 (深度适配 Servy v10.x 企业级标准)
-        & $ServyCliPath install --quiet `
-            --name="TikTok_Gost" `
-            --displayName="TikTok GOST SOCKS5 Gateway" `
-            --description="TikTok Physical Isolation Local SOCKS5 Gateway" `
-            --path="$ToolsDir\gost.exe" `
-            --startupDir="$ToolsDir" `
-            --params="-L `"socks5://${GostUser}:${GostPass}@127.0.0.1:10000`"" `
-            --startupType="Automatic" `
-            --recoveryAction="RestartService" `
-            --maxRestartAttempts=0 `
-            --stdout="$LogsDir\gost.log" `
-            --stderr="$LogsDir\gost_err.log" `
-            --enableSizeRotation `
-            --rotationSize=10 `
-            --maxRotations=5
-
-        # 安装 FRP 客户端服务 (深度适配 Servy v10.x 企业级标准)
-        & $ServyCliPath install --quiet `
-            --name="TikTok_FRP" `
-            --displayName="TikTok FRP Reverse Tunnel" `
-            --description="TikTok Encrypted Reverse Tunnel to VPS Relay" `
-            --path="$ToolsDir\frpc.exe" `
-            --startupDir="$ToolsDir" `
-            --params="-c `"$ToolsDir\frpc.toml`"" `
-            --startupType="Automatic" `
-            --recoveryAction="RestartService" `
-            --maxRestartAttempts=0 `
-            --stdout="$LogsDir\frpc.log" `
-            --stderr="$LogsDir\frpc_err.log" `
-            --enableSizeRotation `
-            --rotationSize=10 `
-            --maxRotations=5
-
-        # 启动两项服务
-        & $ServyCliPath start --quiet --name="TikTok_Gost"
-        & $ServyCliPath start --quiet --name="TikTok_FRP"
-
-        Write-Host "   -> 系统服务安装成功，已设为开机自动启动！" -ForegroundColor Green
-    } catch {
-        Write-Host "⚠️ 服务静默注册失败，请检查杀毒软件权限。" -ForegroundColor Red
+    Write-Host '[4/5] 安装并启动本方案服务...' -ForegroundColor Cyan
+    Install-TunnelService 'TikTok_FRPGost' 'TikTok FRP GOST SOCKS5 Gateway' 'gost.exe' "-C `"$ToolsDir\gost.yaml`"" 'gost'
+    Install-TunnelService 'TikTok_FRP' 'TikTok FRP Reverse Tunnel' 'frpc.exe' "-c `"$ToolsDir\frpc.toml`"" 'frpc'
+    Start-Sleep -Seconds 2
+    foreach ($Name in $ServiceNames) {
+        if ((Get-Service -Name $Name).Status -ne 'Running') { throw "$Name 当前未运行。" }
     }
-} else {
-    Write-Host "⚠️ 未检测到 servy-cli.exe，尝试使用 Windows 备用方式启动..." -ForegroundColor DarkYellow
-}
+    Assert-LocalGateway $true
 
-# 创建桌面便捷管理快捷方式 (如果有 Servy GUI)
-if (Test-Path "$ToolsDir\Servy.exe") {
-    try {
-        $WshShell = New-Object -ComObject WScript.Shell
-        $Shortcut = $WshShell.CreateShortcut("$([Environment]::GetFolderPath('Desktop'))\TikTok服务监控.lnk")
-        $Shortcut.TargetPath = "$ToolsDir\Servy.exe"
-        $Shortcut.WorkingDirectory = $ToolsDir
-        $Shortcut.Save()
-        Write-Host "   -> 桌面已生成【TikTok服务监控】可视化管理面板！" -ForegroundColor Green
-    } catch {}
-}
-
-# -------------------------------------------------------------
-# G. 链路可用性自检
-# -------------------------------------------------------------
-Write-Host ""
-Write-Host "🔍 正在进行本地服务健康自检..." -ForegroundColor Cyan
-Start-Sleep -Seconds 2
-
-$GostRunning = (Get-Process -Name "gost" -ErrorAction SilentlyContinue) -ne $null
-$FrpRunning  = (Get-Process -Name "frpc" -ErrorAction SilentlyContinue) -ne $null
-
-# 端口监听测试 (10000)
-$PortOpen = $false
-try {
-    $client = New-Object System.Net.Sockets.TcpClient
-    $iar = $client.BeginConnect("127.0.0.1", 10000, $null, $null)
-    $wait = $iar.AsyncWaitHandle.WaitOne(1500, $false)
-    if ($wait -and $client.Connected) {
-        $PortOpen = $true
-        $client.EndConnect($iar)
+    Write-Host '[5/5] 设置接通电源时防睡眠...' -ForegroundColor Cyan
+    $PowerOk = $true
+    foreach ($Setting in @('standby-timeout-ac', 'hibernate-timeout-ac')) {
+        & powercfg.exe /change $Setting 0
+        if ($LASTEXITCODE -ne 0) { $PowerOk = $false; Write-Warning "电源设置 $Setting 失败，退出码 $LASTEXITCODE，请手动配置。" }
     }
-    $client.Close()
-} catch {}
+    if ($PowerOk) { Write-Host '已设置接通电源时不自动睡眠/休眠（不保证网络持续可用）。' -ForegroundColor Green }
 
-Write-Host ""
-Write-Host "=================================================" -ForegroundColor Magenta
-Write-Host "🎉 恭喜！住宅机端环境与底层隧道已部署完成！" -ForegroundColor Green
-Write-Host "=================================================" -ForegroundColor Magenta
-Write-Host ""
-Write-Host "【系统服务运行状态】" -ForegroundColor Cyan
-if ($GostRunning) {
-    Write-Host "  ✅ Gost 代理核心   : 正在运行 (进程正常)" -ForegroundColor Green
-} else {
-    Write-Host "  ⚠️ Gost 代理核心   : 未检测到进程，请检查 Servy 面板" -ForegroundColor Red
+    try {
+        $Gui = @(Get-ChildItem -LiteralPath $ServyDir -Recurse -File -Filter 'Servy.exe')
+        if ($Gui.Count -eq 1) {
+            $Shell = New-Object -ComObject WScript.Shell
+            $Shortcut = $Shell.CreateShortcut("$([Environment]::GetFolderPath('Desktop'))\TikTok FRP GOST服务监控.lnk")
+            $Shortcut.TargetPath = $Gui[0].FullName
+            $Shortcut.WorkingDirectory = $Gui[0].DirectoryName
+            $Shortcut.Save()
+        }
+    } catch { Write-Warning "可选的桌面快捷方式创建失败：$($_.Exception.Message)" }
+    Write-Host '本地检查通过：TikTok_FRPGost、TikTok_FRP 为 Running，本方案 SOCKS5 端口 10000 已监听。' -ForegroundColor Green
+    Write-Host "运行目录：$ToolsDir；日志：$LogsDir"
+    Write-Host '以上不证明 TLS、VPS 远端映射或端到端连通。请检查两端日志并单独验证。'
+    Write-Host '服务端须设置 proxyBindAddr = "127.0.0.1"，仅在 VPS 回环开放 10001/33389；RDP 经 SSH/受控通道访问，不直连公网。'
+    Write-Host '未添加 Defender 排除项，也未修改旧 C:\Tools 共享文件。'
+    exit 0
+} catch {
+    Write-Host "安装失败：$($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "不会宣称部署成功。若已部分安装，请检查 $LogsDir 或运行本方案卸载脚本。"
+    exit 1
 }
-
-if ($FrpRunning) {
-    Write-Host "  ✅ FRP 隧道核心    : 正在运行 (进程正常)" -ForegroundColor Green
-} else {
-    Write-Host "  ⚠️ FRP 隧道核心    : 未检测到进程，请检查 Servy 面板" -ForegroundColor Red
-}
-
-if ($PortOpen) {
-    Write-Host "  ✅ 本地代理端口    : 127.0.0.1:10000 (监听正常)" -ForegroundColor Green
-} else {
-    Write-Host "  ⚠️ 本地代理端口    : 127.0.0.1:10000 尚未响应 (等待启动中)" -ForegroundColor Yellow
-}
-
-Write-Host ""
-Write-Host "-------------------------------------------------" -ForegroundColor Yellow
-Write-Host "🔑【SOCKS5 认证凭证信息】" -ForegroundColor Yellow
-Write-Host "👤 代理网关账号 : $GostUser" -ForegroundColor White
-Write-Host "🔑 代理网关密码 : $GostPass" -ForegroundColor White
-Write-Host "📌 远程映射端口 : 10001 (VPS 内部对接)" -ForegroundColor White
-Write-Host "🖥️ 远程桌面端口 : 33389 (RDP 远程管理)" -ForegroundColor White
-Write-Host "-------------------------------------------------" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "💡 提示：本程序已永久常驻后台，开机自启、断线重连、永不休眠。" -ForegroundColor DarkCyan
-Write-Host "如需查看或管理服务，可双击桌面的【TikTok服务监控】快捷方式。" -ForegroundColor DarkCyan
-Write-Host ""
