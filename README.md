@@ -83,9 +83,17 @@ server-frp-gost/
 
 ### 第一步：在云端 VPS 上部署服务端
 
-根据您选择的方案，直接在 VPS 终端执行一行命令（无需手动上传任何文件）：
+直接在 VPS 终端执行**一体化一键命令**（终端会弹出交互式菜单供您 2 选 1）：
 
-#### 选项 A：使用一行命令安装（最推荐，零文件上传门槛）
+#### 🌟 交互式 2 选 1 主入口命令（强烈推荐）
+```bash
+curl -fsSL https://raw.githubusercontent.com/Geoege-xll/server-gost-frp/main/install.sh | bash
+```
+> 执行后终端将弹出友好的菜单，直接敲键盘 `1` 或 `2` 即可选择部署方案；输入 `3` 即可一键平滑升级现有内核！
+
+---
+
+#### 快捷方式：直接指定方案安装 (跳过菜单选择)
 * **【方案一：纯 GOST v3 极速版 (强烈推荐)】**：
   ```bash
   curl -fsSL https://raw.githubusercontent.com/Geoege-xll/server-gost-frp/main/01_Pure_GOST_v3/install_vps_gost_v3.sh | bash
@@ -96,19 +104,13 @@ server-frp-gost/
   ```
 *(注：中国大陆境内或直连受限网络可前置加速镜像，如在 `https://raw...` 前追加 `https://ghproxy.net/`)*
 
-#### 选项 B：克隆仓库或上传脚本运行
+---
+
+#### 离线/源码方式：克隆仓库运行
 ```bash
-# 克隆仓库
 git clone https://github.com/Geoege-xll/server-gost-frp.git
 cd server-gost-frp
-
-# 运行方案一 (纯 GOST v3)
-chmod +x 01_Pure_GOST_v3/install_vps_gost_v3.sh
-bash 01_Pure_GOST_v3/install_vps_gost_v3.sh
-
-# 或运行方案二 (FRP + GOST)
-chmod +x 02_FRP_GOST/install_vps_frp_gost.sh
-bash 02_FRP_GOST/install_vps_frp_gost.sh
+bash install.sh
 ```
 
 > **VPS 脚本自动化处理机制**：
