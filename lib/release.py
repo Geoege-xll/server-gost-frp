@@ -22,11 +22,71 @@ def release_asset(metadata, repo, name):
     asset = assets[0]
     url = asset.get("browser_download_url", "")
     digest = asset.get("digest", "")
-    if not url.startswith(f"https://github.com/{repo}/releases/download/{tag}/"):
+    if url != f"https://github.com/{repo}/releases/download/{tag}/{name}":
         raise ValueError("Asset URL does not belong to the expected upstream release")
     if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         raise ValueError("Upstream SHA-256 digest missing; refusing an unverified download")
     return url, digest[7:]
+
+
+def windows_manifest(output, scheme, tunnel_version, gost_metadata, servy_metadata, frp_metadata=None):
+    # Offline-only packages: components are embedded after VPS-side verification.
+    if scheme not in ("gost", "frp"):
+        raise ValueError("Invalid Windows package scheme")
+    if (scheme == "frp") != (frp_metadata is not None):
+        raise ValueError("FRP metadata is required only for the FRP package")
+    components = []
+    sources = [("gost", "go-gost/gost", gost_metadata, "gost_{version}_windows_amd64.zip", (3, 3, 2)),
+               ("servy", "aelassas/servy", servy_metadata, "servy-{version}-net48-x64-portable.7z", (10, 7, 0))]
+    if scheme == "frp":
+        sources.append(("frpc", "fatedier/frp", frp_metadata, "frp_{version}_windows_amd64.zip", (0, 71, 1)))
+    for component, repo, metadata, pattern, minimum in sources:
+        tag = json.loads(Path(metadata).read_text(encoding="utf-8"))["tag_name"]
+        if not isinstance(tag, str) or not re.fullmatch(r"v?\d+\.\d+(?:\.\d+)?", tag):
+            raise ValueError("Invalid component release tag")
+        # release_asset also rejects draft/prerelease metadata and requires an official URL/digest.
+        asset = pattern.format(version=tag.lstrip("v"))
+        url, digest = release_asset(metadata, repo, asset)
+        parts = tuple(int(part) for part in tag.lstrip("v").split("."))
+        if parts + (0,) * (3 - len(parts)) < minimum:
+            raise ValueError(f"Unsupported {component} version: {tag}")
+        if component == ("gost" if scheme == "gost" else "frpc") and tag != tunnel_version:
+            raise ValueError("Windows tunnel client must match the VPS core release")
+        components.append({"id": component, "repo": repo, "version": tag, "asset": asset,
+                           "url": url, "sha256": digest})
+    manifest = {"schemaVersion": 1, "mode": "offline", "scheme": scheme, "architecture": "amd64",
+                "tunnelVersion": tunnel_version, "components": components}
+    Path(output).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def macos_manifest(output, scheme, tunnel_version, gost_metadata, frp_metadata=None):
+    # Offline-only packages: components are embedded after VPS-side verification.
+    if scheme not in ("gost", "frp"):
+        raise ValueError("Invalid macOS package scheme")
+    if (scheme == "frp") != (frp_metadata is not None):
+        raise ValueError("FRP metadata is required only for the FRP package")
+    sources = [("gost", "go-gost/gost", gost_metadata, "gost", (3, 3, 2))]
+    if scheme == "frp":
+        sources.append(("frpc", "fatedier/frp", frp_metadata, "frp", (0, 71, 1)))
+    components = []
+    for component, repo, metadata, prefix, minimum in sources:
+        tag = json.loads(Path(metadata).read_text(encoding="utf-8"))["tag_name"]
+        if not isinstance(tag, str) or not re.fullmatch(r"v?\d+\.\d+(?:\.\d+)?", tag):
+            raise ValueError("Invalid component release tag")
+        parts = tuple(int(part) for part in tag.lstrip("v").split("."))
+        if parts + (0,) * (3 - len(parts)) < minimum:
+            raise ValueError(f"Unsupported {component} version: {tag}")
+        if component == ("gost" if scheme == "gost" else "frpc") and tag != tunnel_version:
+            raise ValueError("macOS tunnel client must match the VPS core release")
+        for architecture in ("amd64", "arm64"):
+            asset = f"{prefix}_{tag.lstrip('v')}_darwin_{architecture}.tar.gz"
+            url, digest = release_asset(metadata, repo, asset)
+            components.append({"id": component, "architecture": architecture, "repo": repo,
+                               "version": tag, "asset": asset, "url": url, "sha256": digest})
+    manifest = {"schemaVersion": 1, "platform": "macos", "mode": "offline", "scheme": scheme,
+                "architectures": ["amd64", "arm64"], "tunnelVersion": tunnel_version,
+                "components": components}
+    Path(output).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
 def verify(filename, expected):
@@ -91,6 +151,14 @@ def inject(directory, values):
         elif not re.fullmatch(r"[A-Za-z0-9_]+", value):
             raise ValueError(f"Unsafe template value: {key}")
         replacements[key + "_PLACEHOLDER"] = value
+    # macOS scripts remain LF; connection data is never sourced as shell code.
+    for filename in [*Path(directory).glob("*.sh"), *Path(directory).glob("*.conf")]:
+        text = filename.read_text(encoding="utf-8")
+        for key, value in replacements.items():
+            text = text.replace(key, value)
+        if re.search(r"\b[A-Z_]+_PLACEHOLDER\b", text):
+            raise ValueError(f"Unresolved template placeholder in {filename.name}")
+        filename.write_text(text.replace("\r\n", "\n"), encoding="utf-8")
     for filename in Path(directory).glob("*.ps1"):
         text = filename.read_text(encoding="utf-8-sig")
         for key, value in replacements.items():
@@ -106,11 +174,15 @@ def inject(directory, values):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["asset", "verify", "extract", "inject", "ipv4", "tag", "compare"])
+    parser.add_argument("action", choices=["asset", "manifest", "macos-manifest", "verify", "extract", "inject", "ipv4", "tag", "compare"])
     parser.add_argument("values", nargs="*")
     args = parser.parse_args()
     if args.action == "asset":
         print("\n".join(release_asset(*args.values)))
+    elif args.action == "manifest":
+        windows_manifest(*args.values)
+    elif args.action == "macos-manifest":
+        macos_manifest(*args.values)
     elif args.action == "verify":
         verify(*args.values)
     elif args.action == "extract":

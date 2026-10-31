@@ -1,5 +1,5 @@
 #!/bin/bash
-# 纯 GOST v3 入口；Windows 离线包直接使用同目录模板，不再嵌入副本。
+# 纯 GOST v3 入口；Windows / macOS 客户端共用部署逻辑与独立模板。
 set -euo pipefail
 SCRIPT_FILE=${BASH_SOURCE[0]:-}
 if [ -z "$SCRIPT_FILE" ] || [ ! -f "$SCRIPT_FILE" ]; then

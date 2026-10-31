@@ -1,6 +1,8 @@
 ﻿# ==============================================================
-# TikTok 住宅机端 - FRP + GOST 离线部署 (Windows PowerShell 5.1)
+# TikTok 住宅机端 - FRP + GOST 离线部署 (Windows PowerShell 5.1 / PowerShell 7)
 # ==============================================================
+param([switch]$PauseOnFailure)
+
 $ErrorActionPreference = 'Stop'
 $CurrentDir = $PSScriptRoot
 $ToolsDir = 'C:\Tools\TikTokFrpGost'
@@ -9,7 +11,7 @@ $LogsDir = "$ToolsDir\logs"
 $ServyDir = "$ToolsDir\servy"
 $ServiceNames = @('TikTok_FRPGost', 'TikTok_FRP')
 
-# 占位符变量（由 VPS 生成离线包时注入）
+# 占位符变量（由 VPS 生成配置包时注入）
 $VpsServerIp = "VPS_PUBLIC_IP_PLACEHOLDER"
 $AuthToken = "TOKEN_PLACEHOLDER"
 $GostUser = "GOST_USER_PLACEHOLDER"
@@ -67,37 +69,52 @@ function Install-TunnelService([string]$Name, [string]$DisplayName, [string]$Pro
 }
 
 try {
-    # 只读预检：任何占位符或离线文件缺失都在系统变更之前拒绝。
+    # 只读预检：配置、证书及组件清单必须在 UAC 之前有效。
     foreach ($Value in @($VpsServerIp, $AuthToken, $GostUser, $GostPass)) {
-        if ([string]::IsNullOrWhiteSpace($Value) -or $Value -match 'PLACEHOLDER') { throw '配置尚未注入，请使用 VPS 生成的完整离线包。' }
+        if ([string]::IsNullOrWhiteSpace($Value) -or $Value -match 'PLACEHOLDER') { throw '配置尚未注入，请使用 VPS 生成的完整配置包。' }
     }
     $ParsedIp = $null
     if (![Net.IPAddress]::TryParse($VpsServerIp, [ref]$ParsedIp) -or $ParsedIp.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) {
         throw 'VPS 地址必须是服务器证书 IP SAN 中的公网 IPv4 地址。'
     }
-    foreach ($Name in @('gost.exe', 'frpc.exe', 'ca.crt', 'client.crt', 'client.key')) {
+    foreach ($Name in @('ca.crt', 'client.crt', 'client.key')) {
         $File = Get-Item -LiteralPath (Join-Path $CurrentDir $Name)
-        if ($File.PSIsContainer -or $File.Length -eq 0) { throw "离线包文件无效：$Name" }
+        if ($File.PSIsContainer -or $File.Length -eq 0) { throw "部署包证书文件无效：$Name" }
     }
-    $SourceServyDir = Join-Path $CurrentDir 'servy'
-    $SourceCli = Find-ServyCli $SourceServyDir
+    $ComponentHelper = Join-Path $CurrentDir 'windows_components.ps1'
+    if (!(Test-Path -LiteralPath $ComponentHelper -PathType Leaf)) { throw '部署包缺少 windows_components.ps1。' }
+    . $ComponentHelper
+    Assert-ClientComponentManifest -PackageDir $CurrentDir -Scheme 'frp' | Out-Null
     if ([IO.Path]::GetFullPath($CurrentDir).TrimEnd('\').StartsWith($ToolsDir, [StringComparison]::OrdinalIgnoreCase)) {
-        throw '请将离线包解压到运行目录之外，再执行安装。'
+        throw '请将安装包解压到运行目录之外，再执行安装。'
     }
     if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        $Child = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs -Wait -PassThru
+        # Elevate with the engine running this script (PS7 stays PS7); fall back to
+        # built-in Windows PowerShell 5.1 when the executable cannot be resolved.
+        $Engine = (Get-Process -Id $PID).Path
+        if ([string]::IsNullOrEmpty($Engine) -or !(Test-Path -LiteralPath $Engine -PathType Leaf)) {
+            $Engine = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        }
+        $Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+        if ($PauseOnFailure) { $Arguments += ' -PauseOnFailure' }
+        $Child = Start-Process -FilePath $Engine -ArgumentList $Arguments -Verb RunAs -Wait -PassThru
         exit $Child.ExitCode
     }
-    foreach ($Directory in @('C:\Tools', $ToolsDir, $CertsDir, $LogsDir, $ServyDir)) {
-        if ((Test-Path -LiteralPath $Directory) -and ((Get-Item -LiteralPath $Directory).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "拒绝使用链接目录：$Directory" }
-    }
+    # Read-only ACL/owner checks must fail before any service change.
+    Assert-ClientRuntimePath -Root $ToolsDir
     if ($null -ne (Get-Service -Name 'TikTok_Gost' -ErrorAction SilentlyContinue)) {
         throw '检测到旧版共享服务 TikTok_Gost。请先使用对应旧版卸载方式处理；不会修改或删除旧 C:\Tools 共享安装。'
     }
     $OtherServyServices = @(Get-CimInstance Win32_Service | Where-Object { $_.Name -notin $ServiceNames -and $_.PathName -match 'Servy\.Service(?:\.CLI)?\.exe' })
     if ($OtherServyServices.Count -gt 0) { throw "检测到其他 Servy 托管服务：$($OtherServyServices.Name -join ', ')。Servy 10.7 共享运行时可能影响它们，请先处理对应安装。" }
-    foreach ($Name in $ServiceNames) { Assert-OwnedService $Name $SourceCli }
     Assert-LocalGateway $false
+    # 离线组件在提权和静态冲突检查后校验；全部检查完成后才调用 Servy。
+    $ComponentRoot = Initialize-ClientComponents -PackageDir $CurrentDir -Scheme 'frp'
+    $SourceServyDir = Join-Path $ComponentRoot 'servy'
+    $SourceCli = Find-ServyCli $SourceServyDir
+    foreach ($Name in $ServiceNames) { Assert-OwnedService $Name $SourceCli }
+    # Protect the complete destination tree before stopping services or writing files.
+    Initialize-ClientRuntimeDirectory -Root $ToolsDir
 
     Write-Host '[1/5] 停止并注销本方案已有服务（先全部停止，再复制程序）...' -ForegroundColor Cyan
     foreach ($Name in @('TikTok_FRP', 'TikTok_FRPGost')) {
@@ -120,11 +137,11 @@ try {
         if ($Attempt -eq 29) { throw '本方案 gost.exe/frpc.exe 尚未退出；请关闭本方案手动运行的进程后重试，不会强制杀进程。' }
         Start-Sleep -Seconds 1
     }
-    Write-Host '[2/5] 复制离线程序、证书和完整 Servy 目录...' -ForegroundColor Cyan
+    Write-Host '[2/5] 复制已准备的程序、证书和完整 Servy 目录...' -ForegroundColor Cyan
     # 只替换本方案 Servy 树，避免发行包顶层目录名变化留下多个 CLI。
     if (Test-Path -LiteralPath $ServyDir) { Remove-Item -LiteralPath $ServyDir -Recurse -Force }
-    New-Item -Path $ToolsDir, $CertsDir, $LogsDir, $ServyDir -ItemType Directory -Force | Out-Null
-    foreach ($Name in @('gost.exe', 'frpc.exe')) { Copy-Item -LiteralPath (Join-Path $CurrentDir $Name) -Destination $ToolsDir -Force }
+    New-ClientRuntimeSubdirectory -Root $ToolsDir -Name 'servy'
+    foreach ($Name in @('gost.exe', 'frpc.exe')) { Copy-Item -LiteralPath (Join-Path $ComponentRoot $Name) -Destination $ToolsDir -Force }
     foreach ($Name in @('ca.crt', 'client.crt', 'client.key')) { Copy-Item -LiteralPath (Join-Path $CurrentDir $Name) -Destination $CertsDir -Force }
     Get-ChildItem -LiteralPath $SourceServyDir -Force | Copy-Item -Destination $ServyDir -Recurse -Force
     $ServyCliPath = Find-ServyCli $ServyDir
@@ -146,6 +163,7 @@ services:
 "@
     # TOML basic string 与 JSON 的字符串转义兼容。
     $AuthTokenToml = ConvertTo-Json -InputObject $AuthToken -Compress
+    $CertsPath = $CertsDir.Replace('\', '/')
     $FrpcConfig = @"
 serverAddr = "$VpsServerIp"
 serverPort = 9000
@@ -153,9 +171,9 @@ transport.protocol = "tcp"
 transport.wireProtocol = "v2"
 transport.tls.enable = true
 transport.tls.serverName = "$VpsServerIp"
-transport.tls.certFile = "C:/Tools/TikTokFrpGost/certs/client.crt"
-transport.tls.keyFile = "C:/Tools/TikTokFrpGost/certs/client.key"
-transport.tls.trustedCaFile = "C:/Tools/TikTokFrpGost/certs/ca.crt"
+transport.tls.certFile = "$CertsPath/client.crt"
+transport.tls.keyFile = "$CertsPath/client.key"
+transport.tls.trustedCaFile = "$CertsPath/ca.crt"
 transport.heartbeatInterval = 15
 transport.heartbeatTimeout = 90
 transport.tcpMux = true
@@ -238,6 +256,14 @@ VPS 上的 S-UI 出站地址：127.0.0.1:10001（VPS 回环地址，不对公网
     exit 0
 } catch {
     Write-Host "安装失败：$($_.Exception.Message)" -ForegroundColor Red
+    # 不回显源码行内容（脚本含注入凭据），仅输出位置与调用栈便于定位。
+    $At = $_.InvocationInfo
+    $Where = if ($At) { "第 {0} 行 第 {1} 列" -f $At.ScriptLineNumber, $At.OffsetInLine } else { '位置未知' }
+    Write-Host "失败位置：$Where；类型：$($_.Exception.GetType().FullName)" -ForegroundColor Red
+    if ($_.ScriptStackTrace) { Write-Host ("调用栈：{0}" -f ($_.ScriptStackTrace -replace '\r?\n', ' ; ')) -ForegroundColor Red }
     Write-Host "不会宣称部署成功。若已部分安装，请检查 $LogsDir 或运行本方案卸载脚本。"
+    if ($PauseOnFailure) {
+        try { Read-Host 'Press Enter after reading the error above' | Out-Null } catch { }
+    }
     exit 1
 }

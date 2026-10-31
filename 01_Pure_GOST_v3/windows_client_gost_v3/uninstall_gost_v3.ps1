@@ -1,6 +1,8 @@
 ﻿# ==============================================================
 # TikTok 住宅机端 - 仅卸载纯 GOST v3 独立安装
 # ==============================================================
+param([switch]$PauseOnFailure)
+
 $ErrorActionPreference = 'Stop'
 $ToolsDir = 'C:\Tools\TikTokGostV3'
 $ServiceNames = @('TikTok_GostV3')
@@ -25,12 +27,21 @@ function Assert-OwnedService([string]$Name, [string]$Cli) {
 
 try {
     if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        $Child = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs -Wait -PassThru
+        # Elevate with the engine running this script (PS7 stays PS7); fall back to
+        # built-in Windows PowerShell 5.1 when the executable cannot be resolved.
+        $Engine = (Get-Process -Id $PID).Path
+        if ([string]::IsNullOrEmpty($Engine) -or !(Test-Path -LiteralPath $Engine -PathType Leaf)) {
+            $Engine = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        }
+        $Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+        if ($PauseOnFailure) { $Arguments += ' -PauseOnFailure' }
+        $Child = Start-Process -FilePath $Engine -ArgumentList $Arguments -Verb RunAs -Wait -PassThru
         exit $Child.ExitCode
     }
-    foreach ($Directory in @('C:\Tools', $ToolsDir)) {
-        if ((Test-Path -LiteralPath $Directory) -and ((Get-Item -LiteralPath $Directory).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "拒绝操作链接目录：$Directory" }
-    }
+    $ComponentHelper = Join-Path $PSScriptRoot 'windows_components.ps1'
+    if (!(Test-Path -LiteralPath $ComponentHelper -PathType Leaf)) { throw '部署包缺少 windows_components.ps1，请恢复完整配置包后重试。' }
+    . $ComponentHelper
+    Assert-ClientRuntimePath -Root $ToolsDir
     if ($null -ne (Get-Service -Name 'TikTok_Gost' -ErrorAction SilentlyContinue)) {
         throw '检测到旧版共享服务 TikTok_Gost。请使用对应旧版卸载方式处理；本脚本不修改它，也不会删除旧 C:\Tools 共享安装。'
     }
@@ -84,5 +95,8 @@ try {
 } catch {
     Write-Host "卸载未完成：$($_.Exception.Message)" -ForegroundColor Red
     Write-Host '不会终止其他程序或强制删除共享目录；若文件占用，请先关闭本方案 Servy 界面后重试。'
+    if ($PauseOnFailure) {
+        try { Read-Host 'Press Enter after reading the error above' | Out-Null } catch { }
+    }
     exit 1
 }

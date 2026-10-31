@@ -8,4 +8,6 @@ __pycache__/
 *.pfx
 *.p12
 windows_*_pkg.zip
+macos_*_pkg.zip
+client.conf
 SOCKS5账号密码.txt

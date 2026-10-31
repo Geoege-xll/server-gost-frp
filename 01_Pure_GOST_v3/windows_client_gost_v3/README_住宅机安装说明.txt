@@ -1,17 +1,34 @@
 ====================================================================
-TikTok 住宅机离线部署说明（纯 GOST v3）
+住宅机部署说明（纯 GOST v3，完整离线包）
 ====================================================================
 
 【安装】
 1. 完整解压 VPS 生成的 windows_gost_v3_pkg.zip 到运行目录以外的位置，例如桌面。
-2. 右键【一键安装(以管理员运行).bat】，选择【以管理员身份运行】；
-   也可双击后同意 PowerShell 的 UAC 请求。安装和卸载都将保留脚本退出码。
-3. 参数仍含 PLACEHOLDER 或离线文件缺失时，在系统变更前退出（代码 1）；
+2. 打开 64 位【Windows PowerShell】5.1 或【PowerShell】7（不是 CMD），进入解压目录：
+     Set-Location -LiteralPath 'C:\Users\你的用户名\Downloads\解压目录'
+   不要在 ZIP 内运行，不要双击或右键运行 PS1。本包不提供 BAT 入口。
+3. 可先运行只读预检（不联网、不提权、不改服务，不显示密码）：
+     powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\diagnose_windows.ps1" -Pause
+   预检通过不代表安装或链路通过。再运行安装：
+     powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\setup_gost_v3.ps1" -PauseOnFailure
+   非管理员会请求 UAC；失败窗口等待回车，父窗口保留。用 $LASTEXITCODE 查看退出码。
+   -ExecutionPolicy Bypass 仅作用于该子进程，不永久修改系统执行策略。
+4. 参数仍含 PLACEHOLDER、清单无效或必需文件缺失时退出（代码 1）；
    旧服务冲突时拒绝继续操作。独立模板不能直接安装，请使用 VPS 生成的完整包。
 
-离线包根目录必须有 gost.exe、ca.crt、client.crt、client.key；
-servy/ 必须保留完整发行包目录树（可含顶层文件夹），其中恰好一个 servy-cli.exe。
-安装器不会在线补下载，也不会从 PATH 或旧 C:\Tools 借用程序。
+【包模式与组件准备】
+本包为完整离线包，须保留 components.json、windows_components.ps1、diagnose_windows.ps1、
+ca.crt、client.crt、client.key 及全部安装/卸载脚本。配置包包含客户端私钥与密码，必须通过 SFTP/SCP 等安全渠道传送。
+组件已在 VPS 上按清单中的固定官方版本、URL、SHA-256 下载并校验后随包内置；
+纯 GOST 的 Windows 版本与打包时 VPS 版本一致，住宅机不查询 latest、不联网下载。
+使用 x64 Windows 10/11 或 Server 2019+、64 位 Windows PowerShell 5.1 或 PowerShell 7（5.1 需 .NET 4.8，系统自带）。
+安装不要求系统自带 tar.exe，也不下载任何解压器或组件程序。
+已有部署不能靠重新首次安装覆盖，也不能通过改清单或复制旧 EXE 来绕过检查。
+包根目录须有 gost.exe，servy/ 须保留完整发行目录树，
+其中恰好一个非空 servy-cli.exe 与 Servy.exe；缺少文件即失败。
+文件缺失不在线兜底，也不借用 PATH/旧 C:\Tools 程序。
+必需组件检查失败时，在停止现有本方案服务之前退出。
+清单不是独立签名，不能保护被整体篡改的 ZIP；不要修改清单或公开分享配置包。
 
 【本方案管理范围】
 运行目录：C:\Tools\TikTokGostV3
@@ -31,12 +48,20 @@ Servy 10.7 官方实现会使用共享的 Servy host 服务与 %ProgramData%\Ser
 不会自动添加 Windows Defender 排除项。电源设置只对接通电源时禁用自动睡眠/
 休眠；失败会显示警告，不能据此保证不断网。卸载不自动还原电源策略。
 
+【运行目录权限】
+在校验组件和停服务之前，先只读检查运行路径及既有文件树的 owner、DACL 和链接。
+写入程序、私钥或密码前，将本方案目录及既有内容的权限限制为安装账户、
+Administrators、SYSTEM。不会修改已有 C:\Tools 的共享权限。
+若发现不可信账户持有路径，或具有写入、删除、改 ACL 等危险权限，将拒绝继续，
+不自动接管。不要删除整个 C:\Tools 或使用全盘权限重置来绕过；先核对具体报错路径。
+此限制不防范管理员或 SYSTEM，也不会修复已泄漏的旧凭据；配置包与备份须自行保护。
+
 【SOCKS5 账号密码备份】
 安装脚本写入 gost.yaml 时，会同步保存：
   C:\Tools\TikTokGostV3\SOCKS5账号密码.txt
 文件包含配套 VPS、住宅机本地地址、VPS 回环出站地址，以及实际使用的 SOCKS5
 账号和密码；使用 UTF-8 BOM 与 Windows 换行，可用记事本打开。终端会提示路径。
-账号密码由 VPS 生成并随离线包注入，住宅机不会另行生成；重新安装时按本次包
+账号密码由 VPS 生成并随配置包注入，住宅机不会另行生成；重新安装时按本次包
 同步更新配置与 TXT，不会保留旧包的账号密码。不会写入 relay 凭据或证书私钥。
 这是明文密码文件，请妥善保管，不要上传公开仓库或随意转发。
 保存 TXT 不代表服务或隧道已经连通；若后续启动失败，凭据文件仍可用于核对。
@@ -63,7 +88,9 @@ Servy 的 --enableHealth 启用进程健康监测及恢复，--maxRestartAttempt
 表示无限重试；它不是端到端网络健康检测。
 
 【卸载】
-运行【一键卸载(以管理员运行).bat】，仅停止并注销 TikTok_GostV3。
+在同一已打开的 Windows PowerShell 窗口、解压目录中运行：
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\uninstall_gost_v3.ps1" -PauseOnFailure
+仅停止并注销 TikTok_GostV3；运行前同样检查运行目录权限与服务归属。
 确认后才删除 C:\Tools\TikTokGostV3（含证书、配置、日志和账号密码 TXT）；默认保留。
 不会删除 C:\Tools 整个目录、旧版共享快捷方式或其他方案服务。
 若提示文件占用，先关闭本方案的 Servy 界面再重试，不会无差别杀进程。

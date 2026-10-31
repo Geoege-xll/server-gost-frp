@@ -24,6 +24,18 @@ def bash(script, *args, env=None):
                           env=env, capture_output=True, text=True)
 
 
+def release_fixture(directory, component, tag, digest="a" * 64):
+    repo, pattern = {"gost": ("go-gost/gost", "gost_{version}_windows_amd64.zip"),
+                     "frpc": ("fatedier/frp", "frp_{version}_windows_amd64.zip"),
+                     "servy": ("aelassas/servy", "servy-{version}-net48-x64-portable.7z")}[component]
+    asset = pattern.format(version=tag.lstrip("v"))
+    metadata = Path(directory) / (component + "-release.json")
+    metadata.write_text(json.dumps({"tag_name": tag, "assets": [{"name": asset,
+        "browser_download_url": f"https://github.com/{repo}/releases/download/{tag}/{asset}",
+        "digest": "sha256:" + digest if digest else None}]}))
+    return metadata
+
+
 class ReleaseTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -64,10 +76,15 @@ class ReleaseTests(unittest.TestCase):
                     release.release_asset(self.metadata, "go-gost/gost", "binary.zip")
 
     def test_foreign_download_url_rejected(self):
-        self.data["assets"][0]["browser_download_url"] = "https://example.org/binary.zip"
-        self.save()
-        with self.assertRaises(ValueError):
-            release.release_asset(self.metadata, "go-gost/gost", "binary.zip")
+        for url in ("https://example.org/binary.zip",
+                    "https://github.com/go-gost/gost/releases/download/v3.3.2/other.zip",
+                    "https://github.com/go-gost/gost/releases/download/v3.3.2/../../binary.zip",
+                    "https://github.com/go-gost/gost/releases/download/v3.3.2/binary.zip?download=1"):
+            with self.subTest(url=url):
+                self.data["assets"][0]["browser_download_url"] = url
+                self.save()
+                with self.assertRaises(ValueError):
+                    release.release_asset(self.metadata, "go-gost/gost", "binary.zip")
 
     def test_duplicate_asset_rejected(self):
         self.data["assets"] *= 2
@@ -89,6 +106,45 @@ class ReleaseTests(unittest.TestCase):
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), expected)
+
+    def test_pinned_windows_manifest(self):
+        gost = release_fixture(self.root, "gost", "v3.3.2")
+        servy = release_fixture(self.root, "servy", "v10.7")
+        frp = release_fixture(self.root, "frpc", "v0.71.1")
+        output = self.root / "components.json"
+        for scheme, tunnel, extra in (("gost", "v3.3.2", []), ("frp", "v0.71.1", [frp])):
+            with self.subTest(scheme=scheme):
+                release.windows_manifest(output, scheme, tunnel, gost, servy, *extra)
+                data = json.loads(output.read_text())
+                self.assertEqual(data["schemaVersion"], 1)
+                self.assertEqual(data["mode"], "offline")
+                self.assertEqual(data["tunnelVersion"], tunnel)
+                self.assertEqual(data["architecture"], "amd64")
+                self.assertEqual({c["id"] for c in data["components"]},
+                                 {"gost", "servy"} | ({"frpc"} if extra else set()))
+                for component in data["components"]:
+                    self.assertNotIn("latest", component["url"])
+                    self.assertEqual(component["sha256"], "a" * 64)
+                    self.assertTrue(component["url"].endswith("/" + component["asset"]))
+
+    def test_invalid_manifest_sources_fail_closed(self):
+        output = self.root / "components.json"
+        for invalid in ("scheme", "digest", "client-version", "frp-metadata", "old-gost", "old-servy", "old-frp"):
+            with self.subTest(invalid=invalid):
+                gost = release_fixture(self.root, "gost", "v3.3.1" if invalid == "old-gost" else "v3.3.2")
+                servy = release_fixture(self.root, "servy", "v10.6" if invalid == "old-servy" else "v10.7",
+                                        digest=None if invalid == "digest" else "a" * 64)
+                frp = release_fixture(self.root, "frpc", "v0.71.0" if invalid == "old-frp" else "v0.71.1")
+                scheme = "bad" if invalid == "scheme" else "frp"
+                tunnel = "v0.72.0" if invalid == "client-version" else "v0.71.1"
+                extra = [] if invalid == "frp-metadata" else [frp]
+                with self.assertRaises(ValueError):
+                    release.windows_manifest(output, scheme, tunnel, gost, servy, *extra)
+                self.assertFalse(output.exists())
+        with self.assertRaises(ValueError):
+            release.windows_manifest(output, "gost", "v3.3.3", gost, servy)
+        with self.assertRaises(ValueError):
+            release.windows_manifest(output, "gost", "v3.3.2", gost, servy, frp)
 
     def test_archive_paths(self):
         for name in ("../escape", "/tmp/escape", "a/../../escape", "a\\b", "C:/escape"):
@@ -209,6 +265,28 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("SHOULD_NOT_RUN", result.stdout)
 
+    def test_windows_offline_package_installs_sevenzip(self):
+        result = bash('''
+source "$1"
+CLIENT_PLATFORM=windows
+apt-get() { printf '%s\\n' "$*"; }
+apt-cache() { return 0; }
+command() {
+    case "$*" in '-v 7z'|'-v 7zz') return 1 ;; *) builtin command "$@" ;; esac
+}
+install_dependencies install
+''', ROOT / "lib/deploy.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("p7zip-full", result.stdout)
+
+    def test_offline_flag_is_accepted_as_compatibility_noop(self):
+        # Offline is now the only mode; --upgrade/--verify with --offline must not error.
+        for scheme in ("gost", "frp"):
+            for args in (("--client", "windows", "--offline"), ("--offline",)):
+                result = subprocess.run(["bash", str(ROOT / "install.sh"), scheme, *args, "--help"],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL not installed")
     def test_certificate_generation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -250,6 +328,27 @@ class ShellTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("SHOULD_NOT_RUN", result.stdout)
 
+    def test_asset_transfer_or_hash_failure_never_continues(self):
+        for failure in ("http", "hash"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                metadata = release_fixture(root, "gost", "v3.3.2")
+                result = bash('''
+source "$1"
+REPO_ROOT=$2
+FAILURE=$5
+https_get() {
+    [ "$FAILURE" != http ] || return 22
+    printf 'corrupt fixture' > "$2"
+}
+download_asset "$3" go-gost/gost gost_3.3.2_windows_amd64.zip "$4"
+printf SHOULD_NOT_RUN
+''', ROOT / "lib/deploy.sh", ROOT, metadata, root / "download.zip", failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("SHOULD_NOT_RUN", result.stdout)
+                if failure == "hash":
+                    self.assertIn("SHA-256 mismatch", result.stderr)
+
     def test_remote_bootstrap_http_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -274,10 +373,256 @@ class ShellTests(unittest.TestCase):
             self.assertNotIn(forbidden, deployment)
         self.assertNotIn("bash <(curl", (ROOT / "install.sh").read_text())
 
+    def test_temp_download_account_contract_and_fallback(self):
+        text = (ROOT / "lib/deploy.sh").read_text()
+        for required in ("create_temp_download_account()", "useradd -m -g pkgdl -s /bin/bash",
+                         "usermod -e ", "chpasswd", "pkg-dl-", "userdel -r", "userdel -r %s",
+                         # Download-only restriction: dedicated group + sshd Match + ForceCommand wrapper.
+                         "render_pkg_dl_wrapper()", "install_pkg_dl_restriction()",
+                         "Match Group pkgdl", "ForceCommand $wrapper_dest",
+                         "SSHD_CONFIG_PATH:-/etc/ssh/sshd_config",
+                         "PKG_DL_WRAPPER_PATH:-/usr/local/sbin/pkg-dl-command",
+                         "PermitTTY no", "AllowTcpForwarding no", "sshd -t",
+                         "无法安装 SSH 下载专用限制",
+                         # Persistent cleanup timer (survives reboot) + robust revocation.
+                         "pkg-dl-cleanup@.timer", "OnActiveSec=25h", "loginctl terminate-user",
+                         "usermod -L",
+                         # Numbered steps: paste command, yes prompt, password, hash.
+                         "第 1 步 · 在 Windows 住宅机打开 PowerShell",
+                         r'Get-FileHash "$env:USERPROFILE\\Downloads\\%s" -Algorithm SHA256',
+                         "第 1 步 · 在 Mac 住宅机打开终端",
+                         "shasum -a 256 ~/Downloads/%s", "sha256sum \"/root/$package\"",
+                         "第 2 步 · 首次连接询问 yes/no 时输入 yes",
+                         "第 3 步 · 出现 Password: 提示时", "密码：%s",
+                         "第 4 步 · 核对第 1 步命令末尾输出的 SHA-256",
+                         "sftp://%s:%s@%s/%s", "勿用浏览器打开", "手动填表用地址：sftp://%s@%s/%s",
+                         # Account name is recorded so verification can revoke it later.
+                         "printf 'DOWNLOAD_USER=%s\\n' \"$user\" >> \"$CONFIG_DIR/client-verify.env\"",
+                         # Revocation: called only after full PASS, strict name check, /root copy kept.
+                         "revoke_temp_download_account()", "^pkg[a-f0-9]{6}$",
+                         "配置包仍保留在 /root/ 下"):
+            self.assertIn(required, text)
+        # Platform-specific paste lines are gated on the chosen client platform.
+        self.assertIn('if [ "$CLIENT_PLATFORM" != mac ]; then', text)
+        # The SSH restriction must be in place before the account itself is created.
+        self.assertLess(text.index('if ! install_pkg_dl_restriction; then'),
+                        text.index('useradd -m -g pkgdl -s /bin/bash'))
+        # The account is created only after the package is placed under /root.
+        self.assertLess(text.index('install -m 600 "$WORK_DIR/$package" "/root/$package"'),
+                        text.index('create_temp_download_account "$package"'))
+        # Revocation runs inside verify_residential after the PASS banner.
+        self.assertLess(text.index('全部通过：VPS 回环'), text.index('    revoke_temp_download_account'))
+        # Revocation kills sessions before userdel (a lingering process blocks userdel -r).
+        revoke_at = text.index('revoke_temp_download_account()')
+        self.assertLess(text.index('loginctl terminate-user "$user"', revoke_at),
+                        text.index('userdel -r "$user"', revoke_at))
+        # Unsupported (non-root / non-Linux) environments fall back to guidance
+        # instead of attempting account creation.
+        result = bash('''
+source "$1"
+PUBLIC_IP=203.0.113.1
+create_temp_download_account client.zip
+''', ROOT / "lib/deploy.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("未创建临时下载账号", result.stdout)
+        self.assertNotIn("临时密码", result.stdout)
+
+    def test_pkg_dl_wrapper_whitelists_sftp_and_package_scp_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home" / "pkg1a2b3c"
+            home.mkdir(parents=True)
+            (home / "windows_gost_v3_pkg.zip").write_text("package fixture")
+            mock = root / "bin"
+            mock.mkdir()
+            record = root / "record.txt"
+            (mock / "scp").write_text('#!/bin/sh\necho "scp $*" >> "$RECORD"\n')
+            sftp = mock / "sftp-server"
+            sftp.write_text('#!/bin/sh\necho "sftp-server $*" >> "$RECORD"\n')
+            for stub in mock.iterdir():
+                stub.chmod(0o755)
+            wrapper = root / "pkg-dl-command"
+            bash('source "$1"\nrender_pkg_dl_wrapper "$2" > "$3"',
+                 ROOT / "lib/deploy.sh", sftp, wrapper)
+            wrapper.chmod(0o755)
+            allowed = {"sftp": "sftp-server -R",
+                       str(sftp): "sftp-server -R",  # subsystem cmd string (session.c passes Subsystem value)
+                       str(sftp) + " ": "sftp-server -R",  # sshd >=9.6 assembles subsystem_args as "%s %s" -> trailing space
+                       "internal-sftp": "sftp-server -R",
+                       "scp -f windows_gost_v3_pkg.zip": "scp -f ",  # legacy scp sends a relative path
+                       f"scp -f {home}/windows_gost_v3_pkg.zip": "scp -f ",
+                       f"scp -f -d {home}/windows_gost_v3_pkg.zip": "scp -f ",
+                       f"scp -f {home}/windows_gost_v3_pkg.zip ": "scp -f "}  # trailing space is split away
+            denied = ["", "bash", f"scp -t {home}/windows_gost_v3_pkg.zip",
+                      "scp -f /etc/passwd", f"scp -f {home}/../root/x",
+                      f"scp -f {home}/.ssh/id", f"scp -f {home}/pkg.zip; id",
+                      "scp -f *", "scp -f wind*",  # glob must not expand (set -f)
+                      "cat /etc/passwd"]
+            env = dict(os.environ, PATH=str(mock) + os.pathsep + os.environ["PATH"],
+                       HOME=str(home), RECORD=str(record))
+            for command, expected in allowed.items():
+                with self.subTest(allow=command):
+                    result = subprocess.run(["sh", str(wrapper)], capture_output=True, text=True,
+                                            env=dict(env, SSH_ORIGINAL_COMMAND=command))
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn(expected, record.read_text())
+            for command in denied:
+                with self.subTest(deny=command):
+                    result = subprocess.run(["sh", str(wrapper)], capture_output=True, text=True,
+                                            env=dict(env, SSH_ORIGINAL_COMMAND=command))
+                    self.assertNotEqual(result.returncode, 0, command)
+                    self.assertIn("仅允许下载配置包", result.stderr)
+
+    def test_install_pkg_dl_restriction_appends_and_rolls_back(self):
+        script = '''
+source "$1"
+WORK_DIR="$2"
+export SSHD_CONFIG_PATH="$3"
+export PKG_DL_WRAPPER_PATH="$4"
+install_pkg_dl_restriction && echo "RC=0" || echo "RC=1"
+'''
+        for mode in ("happy", "invalid_after_append", "reload_fails", "no_sshd"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                work = root / "work"
+                work.mkdir()
+                sshd_config = root / "sshd_config"
+                original = "Port 22\nSubsystem sftp /usr/lib/openssh/sftp-server\n"
+                sshd_config.write_text(original)
+                wrapper = root / "pkg-dl-command"
+                mock = root / "bin"
+                mock.mkdir()
+                # sshd -T prints the subsystem line (>=9.6 assembles it as "%s %s",
+                # so with no extra args it ends with a space — mimic that); -t
+                # rejects the config once our Match block is present, but only when
+                # FAIL_WITH_MATCH asks for it (simulating sshd -t validation failure
+                # in invalid_after_append).
+                (mock / "sshd").write_text(
+                    '#!/bin/sh\n'
+                    '[ "$1" = -T ] && printf "subsystem sftp /bin/sh \\n" && exit 0\n'
+                    'if [ "$1" = -t ] && [ "$FAIL_WITH_MATCH" = 1 ] && '
+                    'grep -q "Match Group pkgdl" "$SSHD_CONFIG_PATH"; then exit 1; fi\n'
+                    'exit 0\n')
+                (mock / "getent").write_text('#!/bin/sh\nexit 1\n')
+                (mock / "groupadd").write_text('#!/bin/sh\nexit 0\n')
+                (mock / "systemctl").write_text(
+                    '#!/bin/sh\ncase "$*" in reload*) exit %s;; esac\nexit 0\n'
+                    % ("1" if mode == "reload_fails" else "0"))
+                stubs = ["getent", "groupadd", "systemctl"] + ([] if mode == "no_sshd" else ["sshd"])
+                for name in stubs:
+                    (mock / name).chmod(0o755)
+                env = dict(os.environ, PATH=str(mock) + os.pathsep + os.environ["PATH"],
+                           FAIL_WITH_MATCH="1" if mode == "invalid_after_append" else "0")
+                result = bash(script, ROOT / "lib/deploy.sh", work, sshd_config, wrapper, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                config_now = sshd_config.read_text()
+                if mode == "happy":
+                    self.assertIn("RC=0", result.stdout)
+                    self.assertTrue(wrapper.is_file())
+                    self.assertTrue(wrapper.read_text().startswith("#!/bin/sh"))
+                    # trailing space stripped before the executable gate
+                    self.assertIn("SFTP_BIN=/bin/sh\n", wrapper.read_text())
+                    self.assertIn("Match Group pkgdl", config_now)
+                    self.assertIn("ForceCommand %s" % wrapper, config_now)
+                    self.assertIn("PermitTTY no", config_now)
+                    self.assertTrue(config_now.startswith("Port 22"))
+                    self.assertTrue((work / "sshd_config.backup").is_file())
+                else:
+                    self.assertIn("RC=1", result.stdout)
+                    # Failure paths restore the original config and remove the wrapper.
+                    self.assertEqual(config_now, original)
+                    self.assertFalse(wrapper.exists())
+
+    def test_revoke_temp_download_account_after_verify_pass(self):
+        script = '''
+source "$1"
+CONFIG_DIR="$2"
+revoke_temp_download_account
+'''
+        for mode, id_body in (("existing", "exit 0"), ("gone", "exit 1")):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = root / "etc"
+                config.mkdir()
+                (config / "client-verify.env").write_text(
+                    "GOST_USER=user_test\nGOST_PASS=pass_test\nCLIENT_PLATFORM=windows\n"
+                    "DOWNLOAD_USER=pkg1a2b3c\n")
+                mock = root / "bin"
+                mock.mkdir()
+                record = root / "record.txt"
+                (mock / "id").write_text("#!/bin/sh\n" + id_body + "\n")
+                for name in ("userdel", "loginctl", "systemctl", "usermod"):
+                    (mock / name).write_text('#!/bin/sh\necho "%s $*" >> "$RECORD"\n' % name)
+                for stub in mock.iterdir():
+                    stub.chmod(0o755)
+                env = dict(os.environ, PATH=str(mock) + os.pathsep + os.environ["PATH"],
+                           RECORD=str(record))
+                result = bash(script, ROOT / "lib/deploy.sh", config, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("CLEAN", result.stdout)
+                # DOWNLOAD_USER is consumed; SOCKS credentials survive for future --verify runs.
+                self.assertNotIn("DOWNLOAD_USER", (config / "client-verify.env").read_text())
+                self.assertIn("GOST_USER=user_test", (config / "client-verify.env").read_text())
+                # The persistent cleanup timer is disabled for this account.
+                self.assertIn("systemctl disable --now pkg-dl-cleanup@pkg1a2b3c.timer", record.read_text())
+                if mode == "existing":
+                    log = record.read_text()
+                    self.assertIn("-r pkg1a2b3c", log)
+                    # Sessions are terminated BEFORE userdel (-r refuses while processes live).
+                    self.assertLess(log.index("loginctl terminate-user"), log.index("userdel -r"))
+                    self.assertIn("已删除临时下载账号 pkg1a2b3c", result.stdout)
+                else:
+                    self.assertIn("已不存在", result.stdout)
+
+    def test_verify_residential_uses_local_probes_and_rejects_bad_state(self):
+        script = '''
+source "$1"
+verify_residential gost windows user_test pass_test 203.0.113.1 0
+printf 'SCRIPT_COMPLETED'
+'''
+        for mode, expect_rc, expected in (("healthy", 0, ["SCRIPT_COMPLETED", "PASS 匿名 SOCKS5 被拒绝",
+                                                          "PASS 错误密码被拒绝", "198.51.100.7",
+                                                          "PASS 正确凭据经住宅出口访问成功",
+                                                          "配置包仍保留在 /root/ 下"]),
+                                          ("public_bind", 1, ["FAIL SOCKS 映射监听地址异常：0.0.0.0:10001"]),
+                                          ("open_proxy", 1, ["FAIL 匿名 SOCKS5 请求未被拒绝"])):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                mock = root / "bin"
+                mock.mkdir()
+                bind = "0.0.0.0" if mode == "public_bind" else "127.0.0.1"
+                (mock / "ss").write_text(
+                    '#!/bin/sh\ncase "$*" in\n*10001*) printf "LISTEN 0 0 %s:10001 0.0.0.0:*\\n" "$BIND" ;;\n'
+                    '*33389*) printf "LISTEN 0 0 %s:33389 0.0.0.0:*\\n" "$BIND" ;;\nesac\n')
+                # Healthy proxy: only the exact credentials succeed; open_proxy accepts everyone.
+                (mock / "curl").write_text(
+                    '#!/bin/sh\ncase " $* " in *" user_test:pass_test "*) printf "198.51.100.7\\n"; exit 0;; esac\n'
+                    '[ "$OPEN_PROXY" = 1 ] || exit 7\nprintf "198.51.100.7\\n"\n')
+                for stub in mock.iterdir():
+                    stub.chmod(0o755)
+                env = dict(os.environ, PATH=str(mock) + os.pathsep + os.environ["PATH"],
+                           BIND=bind, OPEN_PROXY="1" if mode == "open_proxy" else "")
+                result = bash(script, ROOT / "lib/deploy.sh", env=env)
+                self.assertEqual(result.returncode, expect_rc, result.stdout + result.stderr)
+                for fragment in expected:
+                    self.assertIn(fragment, result.stdout)
+
+    def test_verify_flag_contract(self):
+        text = (ROOT / "lib/deploy.sh").read_text()
+        for required in ("--verify) action=verify", "client-verify.env", 'verify_residential "$SCHEME"',
+                         "VERIFY_TIMEOUT_MIN", "sed -n 's/^GOST_USER=//p'", "--verify 不重新选择住宅机系统",
+                         "验证通过将立即删除临时下载账号"):
+            self.assertIn(required, text)
+        # Credentials are persisted (root-only) before the download account is offered.
+        self.assertLess(text.index('chmod 600 "$CONFIG_DIR/client-verify.env"'),
+                        text.index('create_temp_download_account "$package"'))
+        # First install offers to keep waiting; standalone re-runs are always possible.
+        self.assertIn("是否现在等待住宅机安装并自动验证链路", text)
+        self.assertIn("--verify", (ROOT / "install.sh").read_text())
+
     @unittest.skipUnless(shutil.which("zip") and shutil.which("unzip"), "zip/unzip not installed")
-    def test_offline_package_uses_templates_without_server_keys(self):
-        for scheme, template in (("gost", ROOT / "01_Pure_GOST_v3/windows_client_gost_v3"),
-                                 ("frp", ROOT / "02_FRP_GOST/windows_client_frp_gost")):
+    def test_windows_offline_package_uses_pinned_templates_without_server_keys(self):
+        for scheme in ("gost", "frp"):
             with self.subTest(scheme=scheme), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 work = root / "work"
@@ -286,8 +631,13 @@ class ShellTests(unittest.TestCase):
                 certs.mkdir()
                 for name in ("ca.crt", "client.crt", "client.key", "ca.key", "server.key"):
                     (certs / name).write_text("test fixture, not a real key")
+                gost = release_fixture(root, "gost", "v3.3.2")
+                release_fixture(root, "servy", "v10.7")
+                frp = release_fixture(root, "frpc", "v0.71.1")
+                shutil.copyfile(gost if scheme == "gost" else frp, work / "core-release.json")
                 tag = "v3.3.2" if scheme == "gost" else "v0.71.1"
-                (work / "core-release.json").write_text(json.dumps({"tag_name": tag}))
+                template = ROOT / ("01_Pure_GOST_v3/windows_client_gost_v3" if scheme == "gost"
+                                   else "02_FRP_GOST/windows_client_frp_gost")
                 mock = root / "bin"
                 mock.mkdir()
                 sevenzip = mock / "7z"
@@ -301,10 +651,12 @@ done
 ''')
                 sevenzip.chmod(0o755)
                 env = dict(os.environ, PATH=str(mock) + os.pathsep + os.environ["PATH"])
+                env.pop("PACKAGE_MODE", None)
                 result = bash('''
 source "$1"
 REPO_ROOT=$2
 WORK_DIR=$3/work
+FIXTURES=$3
 SCHEME=$4
 CORE_TAG=$5
 PUBLIC_IP=203.0.113.1
@@ -314,12 +666,15 @@ RELAY_PASS=relay_secret
 GOST_USER=user_test
 GOST_PASS=socks_secret
 release_info() {
-    local tag=v10.7
-    [ "$1" != go-gost/gost ] || tag=v3.3.2
-    printf '{"tag_name":"%s"}' "$tag" > "$3"
-    printf '%s\\n' "$tag"
+    local fixture=servy-release.json
+    [ "$1" != go-gost/gost ] || fixture=gost-release.json
+    cp "$FIXTURES/$fixture" "$3"
+    python3 -I "$REPO_ROOT/lib/release.py" tag "$3"
 }
-download_asset() { printf fixture > "$4"; }
+download_asset() {
+    printf '%s\\n' "$3" >> "$WORK_DIR/downloads"
+    printf fixture > "$4"
+}
 extract_asset() {
     mkdir "$2"
     if [[ "$1" = *frpc.zip ]]; then printf fixture > "$2/frpc.exe";
@@ -328,13 +683,22 @@ extract_asset() {
 build_windows_package "$6" client.zip "$3/certs"
 ''', ROOT / "lib/deploy.sh", ROOT, root, scheme, tag, template, env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue((work / "downloads").exists())
                 with zipfile.ZipFile(work / "client.zip") as archive:
                     names = archive.namelist()
                     self.assertIn("client.key", names)
-                    self.assertIn("gost.exe", names)
-                    self.assertIn("servy/runtime/Servy.Service.CLI.exe", names)
+                    self.assertIn("windows_components.ps1", names)
+                    self.assertIn("diagnose_windows.ps1", names)
+                    self.assertFalse(any(name.endswith(".bat") for name in names))
                     self.assertNotIn("ca.key", names)
                     self.assertNotIn("server.key", names)
+                    manifest = json.loads(archive.read("components.json"))
+                    self.assertEqual(manifest["mode"], "offline")
+                    self.assertEqual(manifest["scheme"], scheme)
+                    self.assertEqual(manifest["tunnelVersion"], tag)
+                    self.assertIn("Package mode: offline", archive.read("VERSIONS.txt").decode())
+                    self.assertIn("gost.exe", names)
+                    self.assertIn("servy/runtime/Servy.Service.CLI.exe", names)
                     if scheme == "frp":
                         self.assertIn("frpc.exe", names)
                     setup_name = "setup_gost_v3.ps1" if scheme == "gost" else "setup_frp_gost.ps1"
@@ -348,8 +712,39 @@ build_windows_package "$6" client.zip "$3/certs"
                     self.assertNotIn("SOCKS5账号密码.txt", names)
                     for name in names:
                         if name.endswith(".ps1"):
-                            self.assertTrue(archive.read(name).startswith(b"\xef\xbb\xbf"), name)
-                            self.assertIsNone(re.search(rb"\b[A-Z_]+_PLACEHOLDER\b", archive.read(name)), name)
+                            data = archive.read(name)
+                            self.assertTrue(data.startswith(b"\xef\xbb\xbf"), name)
+                            self.assertNotIn(b"\n", data.replace(b"\r\n", b""), name)
+                            self.assertIsNone(re.search(rb"\b[A-Z_]+_PLACEHOLDER\b", data), name)
+
+    def test_packaging_missing_digest_aborts_before_component_downloads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = root / "work"
+            work.mkdir()
+            gost = release_fixture(root, "gost", "v3.3.2")
+            release_fixture(root, "servy", "v10.7", digest=None)
+            shutil.copyfile(gost, work / "core-release.json")
+            certs = root / "certs"
+            certs.mkdir()
+            for name in ("ca.crt", "client.crt", "client.key"):
+                (certs / name).write_text("fixture")
+            result = bash('''
+source "$1"
+REPO_ROOT=$2
+WORK_DIR=$3/work
+FIXTURES=$3
+SCHEME=gost
+CORE_TAG=v3.3.2
+release_info() { cp "$FIXTURES/servy-release.json" "$3"; printf 'v10.7\\n'; }
+download_asset() { printf SHOULD_NOT_DOWNLOAD; exit 97; }
+build_windows_package "$REPO_ROOT/01_Pure_GOST_v3/windows_client_gost_v3" client.zip "$FIXTURES/certs"
+printf SHOULD_NOT_INSTALL
+''', ROOT / "lib/deploy.sh", ROOT, root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("SHA-256 digest missing", result.stderr)
+            self.assertNotIn("SHOULD_NOT", result.stdout)
+            self.assertFalse((work / "client.zip").exists())
 
     def test_gost_upgrade_reads_version_not_go_toolchain(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -439,18 +834,13 @@ upgrade_binary
 
 
 class WindowsTemplateTests(unittest.TestCase):
-    def test_source_encoding_and_bat_exit_codes(self):
-        ps1_files = list(ROOT.glob("*/windows_client*/*.ps1"))
-        bat_files = list(ROOT.glob("*/windows_client*/*.bat"))
-        self.assertEqual(len(ps1_files), 4)
-        self.assertEqual(len(bat_files), 4)
+    def test_source_encoding_and_ps1_only_entries(self):
+        ps1_files = list(ROOT.glob("*/windows_client*/*.ps1")) + [ROOT / "lib/windows_components.ps1"]
+        self.assertEqual(len(ps1_files), 5)
+        # PS1 is the sole entry point; batch launchers must not come back.
+        self.assertEqual(list(ROOT.glob("*/windows_client*/**/*.bat")), [])
         for script in ps1_files:
             self.assertTrue(script.read_bytes().startswith(b"\xef\xbb\xbf"), str(script))
-        for script in bat_files:
-            data = script.read_bytes()
-            self.assertNotIn(b"\n", data.replace(b"\r\n", b""))
-            self.assertIn(b'set "ExitCode=%ERRORLEVEL%"', data)
-            self.assertIn(b"exit /b %ExitCode%", data)
 
     def test_pure_gost_listener_chain_and_tls(self):
         text = (ROOT / "01_Pure_GOST_v3/windows_client_gost_v3/setup_gost_v3.ps1").read_text(encoding="utf-8-sig")
@@ -509,6 +899,54 @@ class WindowsTemplateTests(unittest.TestCase):
                 self.assertIn("请先备份所需凭据", prompt)
                 self.assertIn("(y/N)", prompt)
                 self.assertIn("if ($Confirm -ieq 'y')", uninstall)
+
+    def test_component_preparation_precedes_service_mutation(self):
+        for script in ROOT.glob("*/windows_client*/setup_*.ps1"):
+            with self.subTest(script=script.name):
+                text = script.read_text(encoding="utf-8-sig")
+                preflight = text.index("Assert-ClientComponentManifest -PackageDir")
+                elevation = text.index("-Verb RunAs -Wait -PassThru")
+                prepare = text.index("Initialize-ClientComponents -PackageDir")
+                ownership_call = text.rindex("Assert-OwnedService")
+                self.assertLess(preflight, elevation)
+                self.assertLess(elevation, prepare)
+                self.assertLess(text.index("$OtherServyServices.Count -gt 0"), prepare)
+                self.assertLess(prepare, ownership_call)
+                self.assertLess(ownership_call, text.index("Stop-Service"))
+                self.assertIn("Initialize-ClientComponents -PackageDir $CurrentDir", text)
+                self.assertIn("Join-Path $ComponentRoot 'servy'", text)
+                self.assertIn("Join-Path $CurrentDir $Name) -Destination $CertsDir", text)
+                # Offline-only: no downloader staging lifecycle remains in the setups.
+                self.assertNotIn("$Components", text)
+                self.assertNotIn("Remove-ClientComponentStaging", text)
+
+    def test_offline_helper_never_downloads_and_pins_manifest_sources(self):
+        text = (ROOT / "lib/windows_components.ps1").read_text(encoding="utf-8-sig")
+        for required in ("$Manifest.mode -cne 'offline'",
+                         "$Component.url -cne $Url",
+                         "$Component.version -cne $Manifest.tunnelVersion",
+                         "[version]'3.3.2'", "[version]'0.71.1'", "[version]'10.7.0'",
+                         "Assert-ClientComponentSource $PackageDir $Scheme"):
+            self.assertIn(required, text)
+        for forbidden in ("Invoke-Expression", "Invoke-WebRequest", "HttpWebRequest", "ServicePointManager",
+                          "releases/latest", "api.github.com", "Start-Process", "Stop-Service",
+                          "tar.exe", "7z.exe", "7zr.exe", "Expand-Archive"):
+            self.assertNotIn(forbidden, text)
+        body = text[text.index("function Initialize-ClientComponents("):]
+        self.assertLess(body.index("Assert-ClientComponentManifest"), body.index("return [IO.Path]::GetFullPath"))
+
+    def test_offline_helper_has_no_staging_lifecycle(self):
+        text = (ROOT / "lib/windows_components.ps1").read_text(encoding="utf-8-sig")
+        for forbidden in ("New-ClientComponentStaging", "Remove-ClientComponentStaging",
+                          "ClientComponentStagingPaths", "Save-ClientAsset", "Get-ClientTarPath",
+                          "Expand-ClientZip", "Expand-ClientServy", "Add-ClientArchiveMember"):
+            self.assertNotIn(forbidden, text)
+        for required in ("$Acl.SetAccessRuleProtection($true, $false)",
+                         "function New-ClientPrivateDirectory([string]$Path)",
+                         "[IO.Directory]::CreateDirectory($Path, (New-ClientPrivateAcl $true))",
+                         "New-ClientPrivateDirectory $Path"):
+            self.assertIn(required, text)
+        self.assertNotIn("Remove-Item -LiteralPath $Path -Recurse", text)
 
     def test_windows_safety_guards(self):
         for script in ROOT.glob("*/windows_client*/*.ps1"):

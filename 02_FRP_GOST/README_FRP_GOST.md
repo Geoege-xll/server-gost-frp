@@ -1,24 +1,28 @@
 # FRP + GOST 方案
 
-Windows GOST 提供本地认证 SOCKS5，frpc 负责将 SOCKS 与 RDP 通过 TLS 反向映射到 VPS。适合已熟悉 FRP 的部署，代价是多一个进程和一份配置。
+Windows / Mac 上的 GOST 提供本地认证 SOCKS5，frpc 负责通过 TLS 反向映射到 VPS；Windows 另有 RDP 映射，Mac 不映射 RDP。适合已熟悉 FRP 的部署，代价是多一个进程和一份配置。
 
-完整的环境要求、离线包分发、S-UI、验收、RDP 与升级说明见[项目总说明](../README.md)。
+完整的环境要求、完整离线包分发、S-UI、验收、RDP 与升级说明见[项目总说明](../README.md)。
 
 ## 部署与路径
 
 在完整仓库中，以 root / sudo 运行：
 
 ```bash
-bash install.sh frp
+bash install.sh frp                    # 接下来选择住宅机：Windows / macOS
+bash install.sh frp --client windows   # Windows 完整离线包
+bash install.sh frp --client mac       # Mac 完整离线包，自动识别 Intel / Apple Silicon
 # 等价子入口：
 bash 02_FRP_GOST/install_vps_frp_gost.sh
 ```
 
 - VPS：`/usr/local/bin/frps`、`/etc/frp/frps.toml`、`/etc/frp/certs/`。
 - systemd：`frps.service`，监听 TCP 9000。
-- 包：`/root/windows_frp_gost_pkg.zip`；使用 SFTP/SCP 下载，不启动 HTTP 私钥目录分发。
+- Windows 包：`/root/windows_frp_gost_pkg.zip`；Mac 包：`/root/macos_frp_gost_pkg.zip`。均为完整离线包，使用 SFTP/SCP 下载，不启动 HTTP 私钥目录分发。
+- Mac 模板：`macos_client_frp_gost/` + `lib/macos_client.sh`；完整解压后以普通本地账号执行 `sudo bash setup_macos.sh`，使用 launchd，不安装 Servy。`components.json` 固定两种架构的 GOST/frpc 版本、URL、SHA-256，包内 `bin/amd64`、`bin/arm64` 已内置程序及摘要。frpc 与 VPS frps 同版；凭据保存到私有配置目录的 `SOCKS5账号密码.txt`。
+- Mac 只映射 SOCKS 10001→10000；frps 仅允许 10001、maxPortsPerClient=1。下面的两个端口示例仅适用于 Windows。不自动启用 Mac 远程登录、屏幕共享或防睡眠。
 - Windows：`C:\Tools\TikTokFrpGost`；服务 `TikTok_FRPGost`（GOST）与 `TikTok_FRP`（frpc）。
-- 模板：`windows_client_frp_gost/`。frpc 与 frps 来自同一个 Release；Windows GOST、Servy 分别获取官方稳定 Release。
+- 模板：`windows_client_frp_gost/` 与公共组件校验脚本 `lib/windows_components.ps1`。`components.json` 固定官方版本、URL 和 SHA-256；frpc 与 frps 必须来自同一个 Release，Windows GOST/Servy 在打包时选择稳定版，住宅机不自行查询最新版。包内已内置 `gost.exe`、`frpc.exe` 和完整 `servy/` 树，住宅机只校验结构后安装，不联网下载；全部组件校验完成后才停止已有本方案服务。
 
 必须下载完整仓库，单独的子入口不能远程自举；统一在线入口见总说明。
 
@@ -45,7 +49,7 @@ transport.tls.force = true
 ## 客户端配置策略
 
 - `transport.protocol = "tcp"`、`wireProtocol = "v2"`、`tcpMux = true`。
-- 10000→10001、3389→33389 两条 TCP 代理。
+- Windows：10000→10001、3389→33389 两条 TCP 代理。Mac：仅 10000→10001 一条代理。
 - TLS 已提供传输加密，不再对代理流量重复启用 `useEncryption`。
 - `useCompression = false`：视频等已压缩流量通常不值得再压缩；是否改善性能仍需实际测量，不是固定结论。
 - 保留可重连配置与心跳；进程运行不等于代理注册成功，应同时检查 frpc 日志、VPS 映射端口和出口 IP。
@@ -60,7 +64,7 @@ bash install.sh frp --upgrade
 bash install.sh frp --upgrade --version v0.71.1
 ```
 
-升级只替换 VPS frps，不更新 Windows frpc/GOST/Servy 或已有离线包。运行中的服务会重启并断连；候选配置验证失败则不替换，启动健康检查失败则回滚二进制。
+升级只替换 VPS frps，不更新 Windows/Mac frpc/GOST、Servy/launchd 或已有配置包；`--upgrade` 不与 `--client` 同用，也不能用来切换住宅机系统。运行中的服务会重启并断连；候选配置验证失败则不替换，启动健康检查失败则回滚二进制。
 
 旧部署 `/root/frp/frps`、`/root/frp/frps.toml` 可以识别用于升级，但不会自动迁移路径、删除服务端非法字段、修改公网绑定或重新签发证书。升级前请备份并检查旧配置；不要误以为更新二进制等于完成安全迁移。
 

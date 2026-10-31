@@ -4,9 +4,13 @@ set -euo pipefail
 
 usage() {
     printf '%s\n' \
-        '用法：bash install.sh [gost|frp] [--upgrade] [--version vX.Y.Z]' \
-        '      bash install.sh --upgrade [--version vX.Y.Z]' \
-        '无参数：显示首次安装二选一菜单。升级会重启服务并中断现有连接。'
+        '用法：bash install.sh [gost|frp] [--client windows|mac] [--version vX.Y.Z]' \
+        '      bash install.sh [gost|frp] --upgrade [--version vX.Y.Z]' \
+        '首次安装：先选择隧道方案，再选择 Windows 或 macOS 住宅机；非交互请指定 --client。' \
+        '生成完整离线包：组件已在 VPS 下载并校验，住宅机安装时无需联网下载组件。' \
+        '安装完成后按步骤输出一次性下载命令与密码（临时账号经 SSH 限定仅可取包，次日过期自动删除），住宅机无需 root 密码。' \
+        '等待并验证：bash install.sh gost --verify（或 frp；VERIFY_TIMEOUT_MIN=分钟 覆盖默认 30）自动检查回环映射与 SOCKS 认证。' \
+        '无参数显示菜单。升级只更新 VPS 内核，不选择住宅机，会重启服务并中断现有连接。'
 }
 
 fetch() {
@@ -94,7 +98,7 @@ case "${1:-}" in
     2|frp) shift; deploy_main frp "$@" ;;
     3|--upgrade|-u|upgrade) shift; upgrade_detected "$@" ;;
     '')
-        printf '\n住宅出口反向隧道部署\n\n1) 纯 GOST v3（住宅机单进程）\n2) FRP + GOST（住宅机双进程）\n3) 升级已有服务端内核（保留配置，重启会断连）\n4) 退出\n\n'
+        printf '\n住宅出口反向隧道部署\n\n1) 纯 GOST v3（住宅机单进程）\n2) FRP + GOST（住宅机双进程）\n3) 升级已有服务端内核（保留配置，重启会断连）\n4) 退出\n\n首次安装下一步选择 Windows 或 macOS 住宅机。\n生成完整离线包：组件已在 VPS 下载并校验，住宅机安装时无需联网下载组件。\n\n'
         printf '请选择 [1-4]：' >/dev/tty
         read -r choice </dev/tty || fail '无法读取选择；请在命令行指定 gost 或 frp'
         case "$choice" in
